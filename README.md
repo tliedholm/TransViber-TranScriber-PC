@@ -52,7 +52,10 @@ also locally.
    Transcript** checkboxes hide either panel so the editor can take the whole
    width — hidden instructions are still applied — and both toggles are
    remembered. Notes autosave a few seconds after you stop typing and persist
-   between sessions; **Export Notes…** writes them to a .md/.txt file.
+   between sessions — as a plain file at
+   `%LOCALAPPDATA%\TransViber TransScriber\notes.md`, so they can be
+   recovered by hand if the app ever misbehaves. **Export Notes…** writes a
+   copy to a .md/.txt file wherever you like.
 10. **AI Notes** (Notes tab) has a local LLM write structured Markdown notes
     on the transcript, streamed into the editor under a
     `## AI Notes — 2026-08-05 14:30` heading (appended, so earlier notes and
@@ -60,18 +63,17 @@ also locally.
     quotes, follow-ups, and a per-person full-session summary at the end.
     Notes inference runs through the official **llama.cpp CUDA server**
     (`llama-cpp\llama-server.exe`, managed automatically by the app) with
-    **GGUF** models — measured 182 tok/s on `qwen3-4b` and 76 tok/s
-    on `gemma-3-12b` on the RTX 5070 Ti. Models: `qwen3-4b` (default),
-    `qwen3-8b`, `qwen3-14b`, `gemma-3-12b`, `llama-3.1-8b`, `llama-3.2-3b`,
-    `mistral-nemo-12b`, `ministral-8b`, `phi-4-mini`, `granite-3.3-2b` —
-    all Q4_K_M, and most of the small and medium ones also have a **`-q8`
-    variant** (`qwen3-4b-q8`, `qwen3-8b-q8`, `llama-3.1-8b-q8`,
-    `llama-3.2-3b-q8`, `ministral-8b-q8`, `phi-4-mini-q8`,
-    `granite-3.3-2b-q8`): the 8-bit build of the same model — better quality
-    at roughly double the download and VRAM. The 12–14B models stay Q4-only
-    (a Q8 of those wouldn't fit 16 GB alongside the context). You can also
-    type `repo_id` (first Q4_K_M file) or `repo_id::filename.gguf` for any
-    GGUF on Hugging Face. The optional instructions field ADDS to the
+    **GGUF** models — measured 182 tok/s on `qwen3-4b`, 76 tok/s on
+    `gemma-3-12b` and ~180 tok/s on `gpt-oss-20b`, on the RTX 5070 Ti.
+
+    The dropdown is **one entry per model**, each at the best quant that
+    comfortably fits 16 GB: `qwen3-4b` (default) and `qwen3-14b`,
+    `mistral-nemo-12b`, `llama-3.1-8b`, `llama-3.2-3b`, `phi-4-mini`. If you
+    want a smaller build of one of them — less VRAM, quicker download — add
+    a **`-q4` suffix** (`qwen3-14b-q4`, `mistral-nemo-12b-q4`, and so on).
+    You can also type `repo_id` (its Q4_K_M file) or
+    `repo_id::filename.gguf` for any GGUF on Hugging Face, including split
+    multi-part ones. The optional instructions field ADDS to the
     standard format (e.g. "focus on plot events and NPC names"). During
     generation the Notes toolbar shows a progress bar (`43% · 1,204 tok`)
     and a live timer with token count and rate, and the button turns into
@@ -81,28 +83,61 @@ also locally.
     Long transcripts are processed in parts and merged. The button is
     locked while transcribing — the ASR models and the LLM take turns on
     the GPU, never sharing VRAM (the llama-server process is stopped after
-    each notes run and on app close).
+    each notes run and on app close). If a model turns out not to fit, the
+    app retries it with part of the model on the CPU rather than failing,
+    and says so in the status bar — expect it to be a great deal slower.
+    The status bar also reports what the run actually cost: the largest
+    prompt it sent, any thinking tokens the model spent that you never see,
+    and whether the notes were cut off at the length limit.
 
-    The dropdown groups every notes model into Max Detail, Standard Speed,
-    and Quick Review tiers; the transcription dropdown uses equivalent
-    tiers. Google Gemma 3 is distributed under the Gemma terms;
-    `ministral-8b` uses the Mistral Research License (free for personal
-    use); Qwen3 8B/14B are hybrid-thinking models run with thinking
-    disabled.
+    The dropdown groups those into Max Detail, Standard Speed and Quick
+    Review tiers; the transcription dropdown uses equivalent tiers. A fourth
+    group, **Untested — Benchmark Candidates**, holds newer models added so
+    they can be compared against the ones above: `gemma-4-12b`,
+    `qwen3.5-9b`, `qwen3.5-4b`, `gpt-oss-20b`, `lfm2.5-8b-a1b`,
+    `qwen3.8-27b`, `ministral-3-8b` and `granite-4.2-3b`. They are there to
+    be measured, not because they are known to be better on this kind of
+    transcript — only `gpt-oss-20b` has actually been run here. `gpt-oss-20b`
+    and `qwen3.8-27b` are tight on 16 GB, and `qwen3.8-27b` may need a newer
+    llama.cpp than the bundled one.
+
+    Four of those supersede something: `gemma-4-12b` → `gemma-3-12b`,
+    `qwen3.5-9b` → `qwen3-8b`, `ministral-3-8b` → `ministral-8b`,
+    `granite-4.2-3b` → `granite-3.3-2b`. The older four have been taken out
+    of the dropdown but are **still there by name** — type `gemma-3-12b`,
+    `qwen3-8b`, `ministral-8b` or `granite-3.3-2b` to get one back, which is
+    what to do if a replacement turns out not to load. `ministral-3-14b` and
+    `granite-4.2-8b` are reachable the same way. `qwen3-4b` is the one
+    exception kept in the dropdown despite having a successor: it is the
+    startup default, and `qwen3.5-4b` has to beat it first.
+
+    Licensing is not uniform: Google Gemma 3 and 4 are under the Gemma
+    terms, `ministral-8b` under the Mistral Research License (personal use
+    only — its replacement `ministral-3-8b` is Apache-2.0), and
+    `lfm2.5-8b-a1b` under the **LFM Open License v1.0**, which restricts
+    commercial use above $10M revenue. The rest are Apache-2.0 or MIT.
+    Qwen3 8B/14B and the Qwen3.5/3.8 models are hybrid-thinking and are run
+    with thinking switched off — the `qwen3-4b` default is an Instruct build
+    with no thinking mode to begin with. `gpt-oss-20b` reasons rather than
+    thinking aloud, so it gets a low reasoning effort and a larger answer
+    allowance to compensate.
 
 ## Models
 
-All models below are free (no accounts, no quotas) and run locally. As of
-mid-2026 this is the strongest freely licensed lineup that runs on Windows
-with the word/segment timestamps the speaker-merge needs.
+All models below are free (no accounts, no quotas) and run locally. They
+were chosen as the strongest freely licensed options that run on Windows
+with the word/segment timestamps the speaker-merge needs. The accuracy
+notes come from the models' own published benchmarks — none of it has been
+measured on recordings like yours, and sparse multi-track speaker audio is
+a different workload from the continuous speech those benchmarks use.
 
 | Model | VRAM (approx) | Notes |
 |---|---|---|
-| `qwen3-asr-1.7b` | ~5 GB | **Qwen3-ASR** (Apache-2.0, 52 languages) — LLM-based, best with names/jargon/punctuation; supports vocabulary hints; `qwen3-asr-0.6b` is the smaller/faster variant. Runs via the official `qwen-asr` package on CUDA PyTorch, with word timestamps from `Qwen/Qwen3-ForcedAligner-0.6B`. |
+| `qwen3-asr-1.7b` | ~5 GB | **Qwen3-ASR** (Apache-2.0; 30 languages plus 22 Chinese dialects) — LLM-based, strong on names/jargon/punctuation; supports vocabulary hints; `qwen3-asr-0.6b` is the smaller/faster variant. Runs via the official `qwen-asr` package on CUDA PyTorch, with word timestamps from `Qwen/Qwen3-ForcedAligner-0.6B`, which covers 11 languages. |
 | `large-v3-turbo` | ~2 GB | Whisper's best all-rounder; supports vocabulary hints |
-| `parakeet-tdt-0.6b-v2` | ~3 GB | **Best English accuracy** of any local model here, and the fastest (CC-BY-4.0) |
+| `parakeet-tdt-0.6b-v2` | ~3 GB | The fastest model here, and top of the published English WER leaderboards (CC-BY-4.0) |
 | `parakeet-tdt-0.6b-v3` | ~3 GB | Parakeet, 25 European languages (CC-BY-4.0) |
-| `canary-1b-v2` | ~5 GB | **Best multilingual accuracy**, 25 European languages (CC-BY-4.0, commercial OK) |
+| `canary-1b-v2` | ~5 GB | Leads the published multilingual benchmarks; 25 European languages (CC-BY-4.0, commercial OK) |
 | `large-v3` | ~3.5 GB | Most accurate Whisper; ~100 languages |
 | `large-v2` | ~3.5 GB | Older; some prefer it (fewer hallucinations on some audio) |
 | `distil-large-v3.5-ct2` | ~1.5 GB | Newer English-only Distil-Whisper; fast CTranslate2 build, MIT licensed |
@@ -110,19 +145,26 @@ with the word/segment timestamps the speaker-merge needs.
 | `medium` / `medium.en` | ~1.5 GB | Smallest listed; type smaller names (small/base/tiny) manually if ever needed |
 
 Two models score higher on the English Open ASR leaderboard but are not in
-the app for practical reasons: NVIDIA Canary-Qwen-2.5B requires the NeMo
-toolkit (no reliable Windows/ONNX path, weak timestamp support) and Cohere
-Transcribe (03-2026) only ships a vLLM runtime (Linux-oriented, timestamps
-unclear). If either becomes available in onnx-asr or CTranslate2, it can be
-typed straight into the model box or added to the list.
+the app, because neither can be reached through the three backends it has.
+NVIDIA Canary-Qwen-2.5B needs the NeMo toolkit (no reliable Windows/ONNX
+path, weak timestamp support). Cohere Transcribe (03-2026) has supported
+plain Transformers since June 2026, including long-audio chunking — so the
+older "vLLM only" objection no longer holds — but it would still need a new
+audio backend here and its timestamps would have to be checked against what
+the speaker-merge needs. Adding either is real work, not a new name in the
+model box.
 
 The model box is editable — you can also type any CTranslate2 model repo ID
 from Hugging Face (e.g. `distil-whisper/distil-large-v3.5-ct2`), or other
 onnx-asr model names. Whisper models run via
 faster-whisper/CTranslate2; NVIDIA models run via onnx-asr/ONNX Runtime, both
-on the GPU with the shared CUDA 12 runtime. The Language dropdown only
-affects Whisper models — Parakeet/Canary auto-detect. Your RTX 5070 Ti
-(16 GB) handles any of these easily.
+on the GPU with the shared CUDA 12 runtime. The Language dropdown applies to
+Whisper **and** Qwen models (Qwen is given the language by name); only
+Parakeet/Canary ignore it and auto-detect. Note that the routing goes by
+name: anything starting with `qwen` goes to the Qwen backend, names like
+`parakeet…`/`canary…`/`nemo-…` go to onnx-asr, and everything else is
+treated as a Whisper/CTranslate2 repo. Your RTX 5070 Ti (16 GB) handles any
+of these easily.
 
 Note for future package updates: `onnxruntime-gpu` must come from Microsoft's
 CUDA 12 index (`--index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/`);
@@ -151,8 +193,21 @@ editor first.
 - `app/cuda_setup.py` adds those DLL directories at startup so CTranslate2
   finds them.
 - AI Notes needs no Python LLM package: `llama-cpp/llama-server.exe` (the
-  official llama.cpp CUDA build) is in the project folder and the app
-  starts/stops it as needed.
+  official llama.cpp CUDA build, b10034) is in the project folder and the
+  app starts/stops it as needed.
+- `requirements.lock.txt` pins every package in that venv, with the order to
+  install them in (torch first, from PyTorch's own index — the `+cu128`
+  build is not on PyPI). It is a record of what this build was verified
+  against; regenerate it with `pip freeze` after changing the venv.
+- `tests/` holds the offline regression tests — no GPU, no downloads, a few
+  seconds:
+  `.venv\Scripts\python.exe -m unittest discover -s tests -t .`
+  They cover the merge and timestamp logic, the export formats, notes-model
+  resolution and prompt sizing, and the transcript view. Anything involving
+  a real model still needs the headless smoke test:
+  `.venv\Scripts\python.exe app\main.py --selftest audio.wav`, or
+  `--selftest --notes=gemma-4-12b audio.wav` to put one notes model through
+  a run without clicking through the GUI.
 
 ## Standalone build (for sharing)
 

@@ -20,11 +20,15 @@ def _selftest(argv: list[str]) -> int:
     from PySide6.QtCore import QCoreApplication
 
     QCoreApplication(sys.argv[:1])
-    notes = bool(argv) and argv[0] == "--notes"
-    if notes:
+    # --notes, or --notes=<model> to exercise one specific notes model —
+    # the catalog carries models that exist to be compared, and comparing
+    # them through the GUI is neither repeatable nor scriptable.
+    notes_model = ""
+    if argv and argv[0].startswith("--notes"):
+        notes_model = argv[0].partition("=")[2] or "qwen3-4b"
         argv = argv[1:]
     if not argv:
-        print("usage: main.py --selftest [--notes] <audio-file> [model ...]")
+        print("usage: main.py --selftest [--notes[=model]] <audio-file> [model ...]")
         return 2
     audio = Path(argv[0])
     if not audio.is_file():
@@ -52,12 +56,12 @@ def _selftest(argv: list[str]) -> int:
         worker.run()  # synchronously, in this thread
         transcriber.free_asr_models()
 
-    if notes:
+    if notes_model:
         import llm
 
-        print("\n=== notes (qwen3-4b) ===")
+        print(f"\n=== notes ({notes_model}) ===")
         worker = llm.NotesWorker("Alice: The dragon attacked us.\nBob: We ran away fast.",
-                                 model_name="qwen3-4b")
+                                 model_name=notes_model)
         worker.status.connect(lambda m: print(f"  status: {m}"))
         worker.chunk.connect(lambda t: print(t, end="", flush=True))
         worker.failed.connect(lambda m: (print(f"  FAILED: {m}"), failures.append(f"notes: {m}")))

@@ -47,6 +47,47 @@ def writable_dir() -> Path:
     return path
 
 
+def user_data_dir() -> Path:
+    """Per-user folder for the user's own content, source build or frozen.
+
+    Unlike writable_dir(), this is never the project tree: notes are the
+    user's work, and running from source should not drop them next to the
+    code (where .gitignore is the only thing between them and a commit).
+    """
+    base = Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
+    path = base / "TransViber TransScriber"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def notes_path() -> Path:
+    """The autosaved Notes tab text.
+
+    A file rather than a QSettings value: QSettings on Windows is the
+    registry, which is the wrong place for a document that grows without
+    bound, cannot be recovered by hand when the app misbehaves, and is
+    rewritten in full every few seconds while someone types.
+    """
+    return user_data_dir() / "notes.md"
+
+
+def write_atomic(path: Path, text: str) -> None:
+    """Replace a file's contents, or leave the old contents alone.
+
+    Writing in place means a crash, a full disk or a power cut during the
+    write leaves a half-written file — and for the notes autosave, that
+    would destroy the very thing the autosave exists to protect. Writing a
+    sibling and renaming it makes the swap atomic: readers see either the
+    whole old file or the whole new one.
+    """
+    temp = path.with_name(path.name + ".tmp")
+    with open(temp, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp, path)
+
+
 def bundled_model_dir(model_name: str) -> Path | None:
     """The preloaded CTranslate2 model folder shipped inside the build, if any."""
     path = bundle_dir() / "models" / model_name

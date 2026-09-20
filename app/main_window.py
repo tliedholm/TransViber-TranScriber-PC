@@ -7,7 +7,12 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, Qt, QTimer, Slot
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QGuiApplication
+from PySide6.QtGui import (
+    QDragEnterEvent,
+    QDropEvent,
+    QGuiApplication,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -34,6 +39,7 @@ from datetime import datetime
 
 import exporters
 import llm
+import runtime
 from audio import channel_suffixes, probe_streams, tracks_for_file
 from merger import coalesce, merge_tracks
 from models import AUDIO_EXTENSIONS, Track, TrackStatus
@@ -108,6 +114,92 @@ def _add_grouped_models(combo: QComboBox,
         combo.setCurrentIndex(first_model_index)
 
 
+class _TranscriptPane:
+    """Keeps one read-only view in step with the transcript by appending.
+
+    Rebuilding the whole document is what a naive refresh does, and the cost
+    of that grows with the session — on a four-hour recording the app would
+    re-lay-out thousands of paragraphs every 400 ms while still transcribing,
+    which is exactly the case this app exists for.
+
+    Almost every refresh during transcription only lengthens the transcript,
+    so almost every refresh is an append. Two things are not appends and are
+    handled honestly rather than papered over: the *last* block keeps growing
+    as its speaker carries on talking, so it is redrawn every time; and a
+    segment from another track can sort in ahead of blocks already drawn, in
+    which case the whole document is rebuilt. `blocks` are complete HTML
+    paragraphs, already escaped by the caller.
+    """
+
+    def __init__(self, view, stick_to_bottom: bool) -> None:
+        self._view = view
+        self._stick_to_bottom = stick_to_bottom
+        self._blocks: list[str] = []
+        self._tail_start = 0
+
+    def update(self, blocks: list[str]) -> None:
+        """Show `blocks`, doing as little work as they allow.
+
+        A hidden pane is skipped and left marked out of date: the notes
+        mirror can be toggled off, and the tab that isn't showing has no
+        reason to lay anything out. refresh() catches it up when it reappears.
+        """
+        if blocks == self._blocks or not self._view.isVisible():
+            return
+        scrollbar = self._view.verticalScrollBar()
+        at_bottom = scrollbar.value() >= scrollbar.maximum() - 10
+        position = scrollbar.value()
+
+        if not blocks:
+            self._view.clear()
+            self._blocks, self._tail_start = [], 0
+            return
+
+        settled = self._blocks[:-1]
+        if self._blocks and blocks[:len(settled)] == settled:
+            cursor = self._view.textCursor()
+            cursor.setPosition(self._tail_start)
+            cursor.movePosition(QTextCursor.MoveOperation.End,
+                                QTextCursor.MoveMode.KeepAnchor)
+            cursor.removeSelectedText()
+            self._append(cursor, blocks[len(settled):-1])
+        else:
+            self._view.clear()
+            cursor = self._view.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            self._append(cursor, blocks[:-1])
+        self._tail_start = cursor.position()
+        self._append(cursor, blocks[-1:])
+        self._blocks = list(blocks)
+
+        if self._stick_to_bottom and at_bottom:
+            scrollbar.setValue(scrollbar.maximum())
+        elif not self._stick_to_bottom:
+            scrollbar.setValue(position)
+
+    def refresh(self, blocks: list[str]) -> None:
+        """Redraw from scratch — for a pane that was hidden while it changed.
+
+        Called on every tab switch, so a pane that is already showing the
+        right thing has to be left alone: throwing its document away and
+        rebuilding it is exactly the work this class exists to avoid.
+        """
+        if self._blocks == blocks:
+            return
+        self._blocks = []
+        self.update(blocks)
+
+    @staticmethod
+    def _append(cursor, fragments: list[str]) -> None:
+        for fragment in fragments:
+            # insertHtml() of a <p> continues the current paragraph rather
+            # than starting one, so every speaker block needs its own block
+            # opened first — except into a document that is still empty.
+            if not cursor.atStart() or cursor.block().length() > 1:
+                cursor.insertBlock()
+            cursor.insertHtml(fragment)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -121,6 +213,13 @@ class MainWindow(QMainWindow):
         self.has_cuda = cuda_available()
 
         self._build_ui()
+        self._transcript_blocks: list[str] = []
+        self._panes = [
+            _TranscriptPane(self.transcript_view, stick_to_bottom=True),
+            _TranscriptPane(self.notes_transcript_view, stick_to_bottom=False),
+        ]
+        self.tabs.currentChanged.connect(self._refresh_visible_panes)
+        self.check_show_transcript.toggled.connect(self._refresh_visible_panes)
         self._load_settings()
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setInterval(400)
@@ -156,13 +255,19 @@ class MainWindow(QMainWindow):
             "Hugging Face (e.g. distil-whisper/distil-large-v3.5-ct2).\n"
             "'.en' models are English-only and slightly more accurate for English.\n"
             "\n"
-            "Qwen3-ASR (1.7b/0.6b): LLM-based — best with names, jargon, and\n"
-            "punctuation; 52 languages; supports vocabulary hints. Apache-2.0.\n"
+            "Qwen3-ASR (1.7b/0.6b): LLM-based — strong on names, jargon and\n"
+            "punctuation; 30 languages plus 22 Chinese dialects (the forced\n"
+            "aligner that supplies word timings covers 11); supports\n"
+            "vocabulary hints. Apache-2.0.\n"
             "\n"
             "NVIDIA models (via onnx-asr): parakeet-tdt-0.6b-v2 (English) and\n"
-            "-v3 (25 European languages) — fastest, top English benchmark WER.\n"
-            "canary-1b-v2 — best multilingual benchmarks. All CC-BY-4.0.\n"
-            "The Language setting is ignored for NVIDIA models (auto-detect)."
+            "-v3 (25 European languages) — the fastest here, and strong on\n"
+            "published English WER; canary-1b-v2 leads published multilingual\n"
+            "benchmarks. All CC-BY-4.0. None of those rankings has been\n"
+            "measured on recordings like yours.\n"
+            "\n"
+            "The Language setting applies to Whisper and Qwen. NVIDIA models\n"
+            "ignore it and auto-detect."
         )
         bar.addWidget(self.combo_model)
         bar.addWidget(self._make_star_button(self.combo_model, "starred_model"))
@@ -326,18 +431,30 @@ class MainWindow(QMainWindow):
         self.combo_notes_model.setEditable(True)
         self.combo_notes_model.setCurrentText(llm.DEFAULT_LLM)
         self.combo_notes_model.setToolTip(
-            "Local model that writes the notes.\n"
-            "qwen3-4b (default) — strongest of the small models.\n"
-            "qwen3-8b / qwen3-14b — stronger 4-bit Qwen options.\n"
-            "gemma-3-12b — Google's 4-bit instruction model.\n"
-            "llama-3.1-8b / llama-3.2-3b — Pro and fast Llama options.\n"
-            "mistral-nemo-12b / ministral-8b — Pro and fast Mistral options.\n"
-            "The 4-bit models run on the GPU to fit 16 GB VRAM.\n"
-            "phi-4-mini / granite-3.3-2b — smaller and faster.\n"
-            "A '-q8' suffix (e.g. qwen3-8b-q8) is the 8-bit build of that\n"
-            "model: better quality at ~2x the VRAM. Offered for the small\n"
-            "and medium models; the large models only fit at 4-bit.\n"
-            "You can also type any Hugging Face text-model repo id."
+            "Local model that writes the notes. One entry per model, at\n"
+            "the best quant that comfortably fits 16 GB.\n"
+            "qwen3-4b (default) — the proven quick option.\n"
+            "qwen3-14b / mistral-nemo-12b — the large tier.\n"
+            "llama-3.1-8b — mature, steady middle option.\n"
+            "llama-3.2-3b / phi-4-mini — smaller and faster.\n"
+            "\n"
+            "'Benchmark Candidates' are newer models added so they can be\n"
+            "compared, not because they are known to be better. Of these\n"
+            "only gpt-oss-20b has actually been run here. gemma-4-12b\n"
+            "supersedes gemma-3-12b, qwen3.5-9b supersedes qwen3-8b,\n"
+            "ministral-3-8b supersedes ministral-8b (and is Apache-2.0\n"
+            "rather than non-commercial), granite-4.2-3b supersedes\n"
+            "granite-3.3-2b. gpt-oss-20b and qwen3.8-27b are tight on\n"
+            "16 GB; lfm2.5 is under the LFM Open License, not Apache-2.0.\n"
+            "\n"
+            "Anything cut from this list is still available by name — add\n"
+            "a '-q4' suffix for the smaller build of a model here\n"
+            "(e.g. qwen3-14b-q4), or type gemma-3-12b, qwen3-8b,\n"
+            "ministral-8b, granite-3.3-2b, ministral-3-14b or\n"
+            "granite-4.2-8b directly.\n"
+            "\n"
+            "You can also type any Hugging Face GGUF repo id, or\n"
+            "'repo_id::filename.gguf' to pick one exact file."
         )
         notes_toolbar.addWidget(self.combo_notes_model, 1)
         notes_toolbar.addWidget(
@@ -377,8 +494,7 @@ class MainWindow(QMainWindow):
         self._notes_save_timer = QTimer(self)
         self._notes_save_timer.setInterval(3000)
         self._notes_save_timer.setSingleShot(True)
-        self._notes_save_timer.timeout.connect(
-            lambda: QSettings().setValue("notes", self.notes_edit.toPlainText()))
+        self._notes_save_timer.timeout.connect(self._save_notes_text)
         self.notes_edit.textChanged.connect(self._notes_save_timer.start)
         notes_top.addWidget(notes_right)
         notes_top.setStretchFactor(0, 0)
@@ -742,29 +858,19 @@ class MainWindow(QMainWindow):
 
     def _render_transcript(self) -> None:
         segments = merge_tracks(self.tracks)
-        if not segments:
-            self.transcript_view.clear()
-            self.notes_transcript_view.clear()
-            return
-        parts = []
-        for seg in coalesce(segments):
-            ts = _fmt_duration(seg.start)
-            parts.append(
-                f"<p><b>{html.escape(seg.speaker)}</b> "
-                f"<span style='color:gray'>[{ts}]</span>: "
-                f"{html.escape(seg.text.strip())}</p>"
-            )
-        html_text = "\n".join(parts)
-        scrollbar = self.transcript_view.verticalScrollBar()
-        at_bottom = scrollbar.value() >= scrollbar.maximum() - 10
-        self.transcript_view.setHtml(html_text)
-        if at_bottom:
-            scrollbar.setValue(scrollbar.maximum())
-        # Mirror into the Notes tab, preserving the reading position there.
-        notes_scroll = self.notes_transcript_view.verticalScrollBar()
-        pos = notes_scroll.value()
-        self.notes_transcript_view.setHtml(html_text)
-        notes_scroll.setValue(pos)
+        self._transcript_blocks = [
+            f"<p><b>{html.escape(seg.speaker)}</b> "
+            f"<span style='color:gray'>[{_fmt_duration(seg.start)}]</span>: "
+            f"{html.escape(seg.text.strip())}</p>"
+            for seg in coalesce(segments)
+        ]
+        for pane in self._panes:
+            pane.update(self._transcript_blocks)
+
+    def _refresh_visible_panes(self, *_signal_args) -> None:
+        """Catch up a pane that changed while it was hidden."""
+        for pane in self._panes:
+            pane.refresh(self._transcript_blocks)
 
     # ---------- Export ----------
 
@@ -968,10 +1074,43 @@ class MainWindow(QMainWindow):
 
     # ---------- Settings persistence ----------
 
+    def _save_notes_text(self) -> None:
+        """Write the Notes tab to disk, atomically.
+
+        Failures are swallowed on purpose: this runs from a timer a few
+        seconds after every keystroke, and a modal error box over a
+        transient write failure would be unusable. The text is still in the
+        editor, and _save_notes_text runs again on the next edit and on
+        close.
+        """
+        try:
+            runtime.write_atomic(runtime.notes_path(),
+                                 self.notes_edit.toPlainText())
+        except OSError:
+            pass
+
+    def _read_notes_text(self) -> str:
+        """The saved notes, migrating them out of the registry on first run."""
+        path = runtime.notes_path()
+        try:
+            if path.is_file():
+                return path.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+        settings = QSettings()
+        legacy = settings.value("notes", "", str)
+        if legacy:
+            try:
+                runtime.write_atomic(path, legacy)
+                settings.remove("notes")
+            except OSError:
+                pass  # keep the registry copy rather than losing it
+        return legacy
+
     def _load_settings(self) -> None:
         settings = QSettings()
         self.edit_hints.setPlainText(settings.value("hints", "", str))
-        self.notes_edit.setPlainText(settings.value("notes", "", str))
+        self.notes_edit.setPlainText(self._read_notes_text())
         self.edit_ai_instructions.setPlainText(settings.value("ai_instructions", "", str))
         self.check_show_instructions.setChecked(
             settings.value("notes_show_instructions", True, bool))
@@ -997,9 +1136,11 @@ class MainWindow(QMainWindow):
         self._update_hints_visibility()
 
     def _save_settings(self) -> None:
+        # The notes themselves are a file, not a registry value — see
+        # _save_notes_text.
+        self._save_notes_text()
         settings = QSettings()
         settings.setValue("hints", self.edit_hints.toPlainText())
-        settings.setValue("notes", self.notes_edit.toPlainText())
         settings.setValue("ai_instructions", self.edit_ai_instructions.toPlainText())
         settings.setValue("notes_show_instructions",
                           self.check_show_instructions.isChecked())
