@@ -1,0 +1,47 @@
+# --- Virtual environment -------------------------------------------------
+# The in-repo .venv (Python 3.14) is the dependency source of truth for this
+# machine, but it is not portable and must not be tracked.
+.venv/
+
+# --- Python --------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+
+# --- Vendored llama.cpp CUDA runtime (~670 MB of DLLs/EXEs) --------------
+# Redownloaded from the llama.cpp release page, not source.
+llama-cpp/
+
+# --- PyInstaller build artifacts and bundled models (~24 GB) -------------
+packaging/build/
+packaging/dist/
+packaging/models/
+*.log
+
+# --- Model weights, wherever they land -----------------------------------
+*.gguf
+*.ct2
+*.bin
+*.pt
+*.safetensors
+
+# --- User audio and generated transcripts --------------------------------
+# Real user data lives in %APPDATA%/%LOCALAPPDATA%; these guard against
+# test files dropped in the project tree by accident.
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.mp4
+*.mkv
+/output/
+/transcripts/
+
+# --- Windows / editor cruft ----------------------------------------------
+Thumbs.db
+desktop.ini
+*.swp
+*~
+.idea/
+.vscode/
