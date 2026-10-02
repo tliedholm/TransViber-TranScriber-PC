@@ -717,12 +717,28 @@ def _spawn_server(model_path: Path, extra: list[str],
     return process, port
 
 
-def _await_ready(process: subprocess.Popen, port: int, timeout: float = 300) -> bool:
+class _NotesCancelled(Exception):
+    """Cooperative cancellation while downloading/starting the notes engine."""
+
+
+def _check_cancelled(cancelled) -> None:
+    if cancelled is not None and cancelled():
+        raise _NotesCancelled()
+
+
+def _await_ready(process: subprocess.Popen, port: int, timeout: float = 300,
+                 cancelled=None) -> bool:
     """Wait for /health; False if the server died on the way up."""
     import requests
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        try:
+            _check_cancelled(cancelled)
+        except _NotesCancelled:
+            process.kill()
+            process.wait()
+            raise
         if process.poll() is not None:
             return False
         try:
@@ -739,7 +755,7 @@ def _await_ready(process: subprocess.Popen, port: int, timeout: float = 300) -> 
     raise RuntimeError("Notes engine did not become ready within 5 minutes.")
 
 
-def _load(model_name: str, status_cb) -> tuple[int, NotesModel]:
+def _load(model_name: str, status_cb, cancelled=None) -> tuple[int, NotesModel]:
     """Ensure llama-server is running with the requested model.
 
     Returns its port and the *resolved* model — repo, filename, revision and
@@ -747,6 +763,8 @@ def _load(model_name: str, status_cb) -> tuple[int, NotesModel]:
     against that, never against the name they passed in.
     """
     from transcriber import free_asr_models
+
+    _check_cancelled(cancelled)
 
     # Cached on the typed text: the resolved filename of a bare repo id isn't
     # known without asking Hugging Face, and restarting a loaded server to
@@ -766,15 +784,17 @@ def _load(model_name: str, status_cb) -> tuple[int, NotesModel]:
     status_cb(f"Loading notes model '{model_name}' — first use downloads it…")
     model = _apply_identity_policy(_resolve_model(model_name))
     model_path, model = _download_gguf(model, status_cb)
+    _check_cancelled(cancelled)
 
     context = model.context or DEFAULT_CONTEXT_SIZE
     status_cb(f"Starting notes engine with '{model_name}' at {context:,} tokens…")
     attempts = _launch_attempts(model)
     for number, (extra, description) in enumerate(attempts):
+        _check_cancelled(cancelled)
         if description:
             status_cb(f"Not enough VRAM — retrying '{model_name}', {description}…")
         process, port = _spawn_server(model_path, extra, context)
-        if _await_ready(process, port):
+        if _await_ready(process, port, cancelled=cancelled):
             break
         log = _log_text()
         if number == len(attempts) - 1 or not _looks_like_oom(log):
@@ -961,9 +981,14 @@ class NotesWorker(QThread):
         max_new = self._max_new_tokens()
         pieces: list[str] = []
         think_filter = _LeadingThinkFilter()
-        response = requests.post(
-            f"http://127.0.0.1:{port}/v1/chat/completions",
-            json=payload, stream=True, timeout=(30, 600))
+        try:
+            response = requests.post(
+                f"http://127.0.0.1:{port}/v1/chat/completions",
+                json=payload, stream=True, timeout=(30, 600))
+        except requests.RequestException:
+            if self._stop:
+                return ""
+            raise
         try:
             response.raise_for_status()
             # Decode ourselves: llama-server sends UTF-8 but no charset header,
@@ -1007,6 +1032,9 @@ class NotesWorker(QThread):
                 self.progress.emit(
                     min(99, int((self._passes_done + fraction) / self._passes_total * 100)),
                     self._tokens_total)
+        except requests.RequestException:
+            if not self._stop:
+                raise
         finally:
             response.close()
         held = think_filter.flush()
@@ -1239,7 +1267,9 @@ class NotesWorker(QThread):
 
     def run(self) -> None:
         try:
-            port, self.model = _load(self.model_name, self.status.emit)
+            port, self.model = _load(self.model_name, self.status.emit,
+                                     cancelled=lambda: self._stop)
+            _check_cancelled(lambda: self._stop)
             total_tokens = self._try_count_tokens(port, self.transcript)
             if total_tokens is None:
                 # /tokenize is out. Sizing falls back to the character
@@ -1286,8 +1316,17 @@ class NotesWorker(QThread):
             self._report_run()
             self.progress.emit(100, self._tokens_total)
             self.completed.emit()
+        except _NotesCancelled:
+            self.cancelled = True
+            self.chunk.emit("\n\n*(cancelled)*")
+            self.completed.emit()
         except Exception as exc:
-            self.failed.emit(str(exc))
+            if self._stop:
+                self.cancelled = True
+                self.chunk.emit("\n\n*(cancelled)*")
+                self.completed.emit()
+            else:
+                self.failed.emit(str(exc))
 
 
     def _report_run(self) -> None:

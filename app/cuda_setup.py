@@ -7,6 +7,15 @@ import os
 import sys
 from pathlib import Path
 
+# add_dll_directory removes a directory when its handle is closed/collected.
+_dll_handles = []
+
+
+def _add_dll_dir(path: Path) -> None:
+    if hasattr(os, "add_dll_directory"):
+        _dll_handles.append(os.add_dll_directory(str(path)))
+    os.environ["PATH"] = str(path) + os.pathsep + os.environ.get("PATH", "")
+
 
 def add_nvidia_dll_dirs() -> None:
     if getattr(sys, "frozen", False):
@@ -16,8 +25,7 @@ def add_nvidia_dll_dirs() -> None:
         root = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
         torch_lib = root / "torch" / "lib"
         if torch_lib.is_dir():
-            os.add_dll_directory(str(torch_lib))
-            os.environ["PATH"] = str(torch_lib) + os.pathsep + os.environ.get("PATH", "")
+            _add_dll_dir(torch_lib)
         base = root / "nvidia"
     else:
         base = Path(sys.prefix) / "Lib" / "site-packages" / "nvidia"
@@ -26,8 +34,7 @@ def add_nvidia_dll_dirs() -> None:
     for sub in base.iterdir():
         bin_dir = sub / "bin"
         if bin_dir.is_dir():
-            os.add_dll_directory(str(bin_dir))
-            os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
+            _add_dll_dir(bin_dir)
 
 
 add_nvidia_dll_dirs()

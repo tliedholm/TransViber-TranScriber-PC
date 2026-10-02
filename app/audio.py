@@ -10,7 +10,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import numpy as np
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import numpy as np
 
 from models import Track, default_speaker_name
 
@@ -83,6 +86,7 @@ def tracks_for_file(path: Path, split_stereo: bool = False) -> list[Track]:
 def decode_track_audio(path: Path, stream_index: int | None, channel: int | None) -> np.ndarray:
     """Decode one stream (and optionally one channel of it) to mono float32 16 kHz."""
     import av
+    import numpy as np
     from av.audio.resampler import AudioResampler
 
     to_mono = AudioResampler(format="flt", layout="mono", rate=SAMPLE_RATE)
@@ -132,4 +136,4 @@ def decode_track_audio(path: Path, stream_index: int | None, channel: int | None
 
     if not chunks:
         return np.zeros(0, dtype=np.float32)
-    return np.concatenate(chunks).astype(np.float32)
+    return np.concatenate(chunks).astype(np.float32, copy=False)

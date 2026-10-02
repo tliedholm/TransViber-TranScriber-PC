@@ -74,12 +74,14 @@ def _selftest(argv: list[str]) -> int:
 
 
 def _setup_frozen_logging() -> None:
-    """In the windowed standalone build there is no console: route stdout/
-    stderr (tracebacks, library chatter) to a log file so startup problems
-    on someone else's PC can actually be diagnosed."""
+    """Log both pythonw source launches and the windowed standalone build.
+
+    With no console, tracebacks and startup timings would otherwise vanish.
+    """
     import runtime
 
-    if not runtime.IS_FROZEN or sys.stderr is not None and sys.stderr.isatty():
+    if (not runtime.IS_FROZEN and sys.stderr is not None
+            or sys.stderr is not None and sys.stderr.isatty()):
         return
     log_path = runtime.writable_dir() / "app.log"
     # Append across launches so a crash log survives the user relaunching the
@@ -106,16 +108,26 @@ def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "--selftest":
         return _selftest(sys.argv[2:])
     _setup_frozen_logging()
+    from time import perf_counter
+
+    started = perf_counter()
+
+    def milestone(message: str) -> None:
+        print(f"Startup +{perf_counter() - started:.3f}s: {message}", flush=True)
+
+    milestone("loading interface")
 
     # Everything below can fail on import; it is loaded only now so that a
     # failure lands in the log file set up above.
     import ctypes
 
+    from PySide6.QtCore import QTimer
     from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication
 
     import runtime
     from main_window import MainWindow
+    milestone("interface imported")
 
     # Give the process its own taskbar identity so Windows shows the app
     # icon instead of pythonw's.
@@ -129,6 +141,7 @@ def main() -> int:
         app.setWindowIcon(QIcon(str(icon_path)))
     window = MainWindow()
     window.show()
+    QTimer.singleShot(0, lambda: milestone("window ready"))
     return app.exec()
 
 

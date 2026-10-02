@@ -43,10 +43,9 @@ import runtime
 from audio import channel_suffixes, probe_streams, tracks_for_file
 from merger import coalesce, merge_tracks
 from models import AUDIO_EXTENSIONS, Track, TrackStatus
-from stats import StatsPoller
+from stats import DeviceProbe, StatsPoller
 from transcriber import (
     TranscribeWorker,
-    cuda_available,
     engine_for,
     free_asr_models,
 )
@@ -178,7 +177,7 @@ class _TranscriptPane:
             scrollbar.setValue(position)
 
     def refresh(self, blocks: list[str]) -> None:
-        """Redraw from scratch — for a pane that was hidden while it changed.
+        """Catch up a pane that was hidden while the transcript changed.
 
         Called on every tab switch, so a pane that is already showing the
         right thing has to be left alone: throwing its document away and
@@ -186,7 +185,6 @@ class _TranscriptPane:
         """
         if self._blocks == blocks:
             return
-        self._blocks = []
         self.update(blocks)
 
     @staticmethod
@@ -210,7 +208,9 @@ class MainWindow(QMainWindow):
         self.tracks: list[Track] = []
         self.worker: TranscribeWorker | None = None
         self.notes_worker: llm.NotesWorker | None = None
-        self.has_cuda = cuda_available()
+        self.has_cuda: bool | None = None
+        self._closing = False
+        self._notes_load_failed = False
 
         self._build_ui()
         self._transcript_blocks: list[str] = []
@@ -225,6 +225,12 @@ class MainWindow(QMainWindow):
         self._refresh_timer.setInterval(400)
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.timeout.connect(self._render_transcript)
+        self.device_probe = DeviceProbe(self)
+        self.device_probe.detected.connect(self._on_device_detected)
+        QTimer.singleShot(0, lambda: self.device_probe.start() if not self._closing else None)
+        self._close_timer = QTimer(self)
+        self._close_timer.setInterval(100)
+        self._close_timer.timeout.connect(self.close)
 
     # ---------- UI construction ----------
 
@@ -280,11 +286,9 @@ class MainWindow(QMainWindow):
 
         bar.addWidget(QLabel("Device:"))
         self.combo_device = QComboBox()
-        self.combo_device.addItem("GPU (CUDA)" if self.has_cuda else "GPU (unavailable)", "cuda")
+        self.combo_device.addItem("GPU (checking…)", "cuda")
         self.combo_device.addItem("CPU", "cpu")
-        if not self.has_cuda:
-            self.combo_device.model().item(0).setEnabled(False)
-            self.combo_device.setCurrentIndex(1)
+        self.combo_device.setEnabled(False)
         bar.addWidget(self.combo_device)
 
         bar.addStretch()
@@ -301,6 +305,7 @@ class MainWindow(QMainWindow):
 
         self.btn_transcribe = QPushButton("Transcribe")
         self.btn_transcribe.setDefault(True)
+        self.btn_transcribe.setEnabled(False)
         self.btn_transcribe.clicked.connect(self.toggle_transcription)
         bar.addWidget(self.btn_transcribe)
         self.btn_export = QPushButton("Export…")
@@ -528,10 +533,22 @@ class MainWindow(QMainWindow):
         self.check_dark.toggled.connect(self._set_dark_mode)
         self.statusBar().addPermanentWidget(self.check_dark)
 
-        device_text = "GPU: CUDA available" if self.has_cuda else "GPU not available — using CPU"
-        self.device_label = QLabel(device_text)
+        self.device_label = QLabel("Checking GPU…")
         self.statusBar().addPermanentWidget(self.device_label)
         self.statusBar().showMessage("Ready")
+
+    @Slot(bool)
+    def _on_device_detected(self, available: bool) -> None:
+        self.has_cuda = available
+        self.combo_device.setItemText(0, "GPU (CUDA)" if available else "GPU (unavailable)")
+        self.combo_device.model().item(0).setEnabled(available)
+        if not available:
+            self.combo_device.setCurrentIndex(1)
+        self.device_label.setText(
+            "GPU: CUDA available" if available else "GPU not available — using CPU")
+        if not self._closing:
+            self.combo_device.setEnabled(self.worker is None)
+            self.btn_transcribe.setEnabled(self.notes_worker is None)
 
     @staticmethod
     def _format_elapsed(seconds: float) -> str:
@@ -717,13 +734,15 @@ class MainWindow(QMainWindow):
             return
         self.table.setRowCount(0)
         self.tracks.clear()
-        self.transcript_view.clear()
-        self.notes_transcript_view.clear()
+        self._refresh_timer.stop()
+        self._render_transcript()
         self.btn_export.setEnabled(False)
 
     # ---------- Transcription ----------
 
     def toggle_transcription(self) -> None:
+        if self._closing or self.notes_worker is not None or self.has_cuda is None:
+            return
         if self.worker is not None:
             self.btn_transcribe.setEnabled(False)
             self.btn_transcribe.setText("Cancelling…")
@@ -785,6 +804,7 @@ class MainWindow(QMainWindow):
     def _set_status(self, row: int, text: str) -> None:
         self.table.blockSignals(True)
         self.table.item(row, COL_STATUS).setText(text)
+        self.table.item(row, COL_STATUS).setToolTip("")
         self.table.blockSignals(False)
 
     @Slot(int)
@@ -823,7 +843,8 @@ class MainWindow(QMainWindow):
         if self.worker is not None:
             self.worker.wait()
             self.worker = None
-        free_asr_models()
+        if self._closing:
+            return
         if cancelled:
             for i, track in enumerate(self.tracks):
                 if track.status == TrackStatus.TRANSCRIBING:
@@ -961,10 +982,13 @@ class MainWindow(QMainWindow):
     # ---------- AI notes ----------
 
     def toggle_ai_notes(self) -> None:
+        if self._closing or self.worker is not None:
+            return
         if self.notes_worker is not None:
             self.btn_ai_notes.setEnabled(False)
             self.btn_ai_notes.setText("Cancelling…")
             self.notes_worker.stop()
+            llm.free_llm()  # end a stalled stream instead of waiting for its read timeout
             return
         segments = merge_tracks(self.tracks)
         if not segments:
@@ -1030,6 +1054,8 @@ class MainWindow(QMainWindow):
             cancelled = self.notes_worker.cancelled
             self.notes_worker = None
         llm.free_llm()
+        if self._closing:
+            return
         self._notes_elapsed_timer.stop()
         stats = ""
         if self._notes_run_started is not None:
@@ -1053,6 +1079,8 @@ class MainWindow(QMainWindow):
 
     def _on_ai_notes_failed(self, message: str) -> None:
         self._on_ai_notes_done()
+        if self._closing:
+            return
         self.statusBar().showMessage("AI notes failed")
         QMessageBox.critical(self, "AI notes failed", message)
 
@@ -1077,25 +1105,30 @@ class MainWindow(QMainWindow):
     def _save_notes_text(self) -> None:
         """Write the Notes tab to disk, atomically.
 
-        Failures are swallowed on purpose: this runs from a timer a few
-        seconds after every keystroke, and a modal error box over a
-        transient write failure would be unusable. The text is still in the
-        editor, and _save_notes_text runs again on the next edit and on
-        close.
+        Failures appear in the status bar: a modal error after every edit
+        would be unusable. The text stays in the editor and is retried on
+        the next edit and on close. A failed initial read disables autosave
+        so an empty editor cannot overwrite the saved document.
         """
+        if self._notes_load_failed:
+            return  # never overwrite a document we failed to read
         try:
             runtime.write_atomic(runtime.notes_path(),
                                  self.notes_edit.toPlainText())
-        except OSError:
-            pass
+        except OSError as exc:
+            self.statusBar().showMessage(f"Notes could not be saved: {exc}")
 
     def _read_notes_text(self) -> str:
         """The saved notes, migrating them out of the registry on first run."""
         path = runtime.notes_path()
         try:
-            if path.is_file():
-                return path.read_text(encoding="utf-8")
-        except OSError:
+            return path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            pass
+        except (OSError, UnicodeError) as exc:
+            self._notes_load_failed = True
+            self.statusBar().showMessage(
+                f"Saved notes could not be read; autosave disabled to protect the file: {exc}")
             return ""
         settings = QSettings()
         legacy = settings.value("notes", "", str)
@@ -1110,7 +1143,11 @@ class MainWindow(QMainWindow):
     def _load_settings(self) -> None:
         settings = QSettings()
         self.edit_hints.setPlainText(settings.value("hints", "", str))
-        self.notes_edit.setPlainText(self._read_notes_text())
+        self.notes_edit.blockSignals(True)
+        try:
+            self.notes_edit.setPlainText(self._read_notes_text())
+        finally:
+            self.notes_edit.blockSignals(False)
         self.edit_ai_instructions.setPlainText(settings.value("ai_instructions", "", str))
         self.check_show_instructions.setChecked(
             settings.value("notes_show_instructions", True, bool))
@@ -1153,21 +1190,28 @@ class MainWindow(QMainWindow):
     # ---------- Shutdown ----------
 
     def closeEvent(self, event) -> None:
-        self._save_settings()
-        if self.worker is not None:
-            self.worker.stop()
-            self.worker.wait(5000)
-        if self.notes_worker is not None:
-            # Kill the server *before* waiting: the worker is almost always
-            # parked in requests.iter_lines() on the llama-server SSE stream,
-            # whose read timeout is 600 s. Its _stop flag is only checked
-            # between lines, so ending the stream is what actually releases
-            # it — waiting first would just burn the timeout.
-            self.notes_worker.stop()
-            llm.free_llm()
-            self.notes_worker.wait(10000)
-        else:
-            llm.free_llm()  # stop an idle llama-server, if one is running
-        self.stats_poller.stop()
-        self.stats_poller.wait(3000)
+        if not self._closing:
+            self._closing = True
+            self._notes_save_timer.stop()
+            self._save_settings()
+            self.centralWidget().setEnabled(False)
+            self.statusBar().showMessage("Closing — waiting for background work to stop…")
+            if self.worker is not None:
+                self.worker.stop()
+            if self.notes_worker is not None:
+                self.notes_worker.stop()
+            self.stats_poller.stop()
+        # Never destroy a running QThread. Keep the event loop alive for its
+        # queued signals; a model download/load may not be interruptible yet.
+        # Kill any notes server that was started during cancellation too.
+        llm.free_llm()
+        threads = (self.worker, self.notes_worker, self.stats_poller, self.device_probe)
+        if any(thread is not None and thread.isRunning() for thread in threads):
+            event.ignore()
+            if not self._close_timer.isActive():
+                self._close_timer.start()
+            return
+        self._close_timer.stop()
+        self._save_settings()  # include any final notes chunks queued during cancellation
+        free_asr_models()
         event.accept()

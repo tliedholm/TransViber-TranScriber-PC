@@ -115,6 +115,21 @@ Qt `Signal`s (never touch widgets off the main thread):
 `StatsPoller` (`stats.py`, the GPU/VRAM/CPU/RAM status readout via NVML +
 psutil). `MainWindow` connects to their signals and updates widgets.
 
+`DeviceProbe` checks CUDA through the driver API in a background thread
+after the window opens. Do not import CTranslate2/PyTorch to detect the GPU
+at startup: CTranslate2's package import loads PyTorch too. All inference
+engines and NumPy stay unloaded until needed. The source `.bat` and
+`pythonw` launches also log click/startup timings to `app.log`.
+
+Shutdown is asynchronous: `closeEvent` disables the UI, requests
+cancellation, and retries via a timer until every worker has stopped.
+Never accept a close while a QThread is running. Stats polling has an
+interruptible wait; notes startup checks cancellation before/after downloads
+and while waiting for the server. Cancel AI Notes kills a stalled stream.
+The ASR model stays cached between runs and is released when its model/device
+changes, notes starts, or the app closes; cleanup must not import PyTorch
+merely to check whether it has anything to release.
+
 ### The core merge idea
 
 Each track is transcribed independently with VAD (silence while others talk

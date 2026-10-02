@@ -179,9 +179,10 @@ def free_asr_models() -> None:
 
     gc.collect()
     try:
-        import torch
+        import sys
 
-        if torch.cuda.is_available():
+        torch = sys.modules.get("torch")
+        if torch is not None and torch.cuda.is_initialized():
             torch.cuda.empty_cache()
     except Exception:
         pass
@@ -207,9 +208,26 @@ def split_on_word_gaps(fw_segment, speaker: str, max_gap: float = SPLIT_GAP_SECO
 
 
 def cuda_available() -> bool:
-    import ctranslate2
+    """Query the driver without importing an inference engine (or PyTorch).
 
-    return ctranslate2.get_cuda_device_count() > 0
+    Model loading still checks backend compatibility and falls back to CPU.
+    """
+    import ctypes
+    import sys
+
+    try:
+        driver = (ctypes.WinDLL("nvcuda.dll") if sys.platform == "win32"
+                  else ctypes.CDLL("libcuda.so.1"))
+        driver.cuInit.argtypes = [ctypes.c_uint]
+        driver.cuInit.restype = ctypes.c_int
+        driver.cuDeviceGetCount.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        driver.cuDeviceGetCount.restype = ctypes.c_int
+        if driver.cuInit(0) != 0:
+            return False
+        count = ctypes.c_int()
+        return driver.cuDeviceGetCount(ctypes.byref(count)) == 0 and count.value > 0
+    except (OSError, AttributeError):
+        return False
 
 
 @contextmanager
@@ -295,8 +313,7 @@ def _get_model(model_name: str, device: str, status_cb) -> object:
     engine = engine_for(model_name)
     key = (engine, model_name, device)
     if _model_cache["key"] != key:
-        _model_cache["key"] = None
-        _model_cache["model"] = None  # free previous model before loading a new one
+        free_asr_models()
         status_cb(f"Loading model '{model_name}' ({device}) — first use downloads it…")
         with hf_download_progress(status_cb, model_name):
             if engine == "qwen":
@@ -417,6 +434,8 @@ class TranscribeWorker(QThread):
         track = self.tracks[i]
         self.track_started.emit(i)
         audio = decode_track_audio(track.path, track.stream_index, track.channel)
+        if self._stop:
+            return True
 
         # Speech regions: silences under 2 s stay inside a region (harmless),
         # longer ones become region boundaries; regions are capped below the
@@ -464,6 +483,8 @@ class TranscribeWorker(QThread):
                     language=None,
                     return_time_stamps=False,
                 )
+                if self._stop:
+                    return True
                 probe_language = (probe_results[0].language or "").split(",", 1)[0].strip()
                 if probe_language in model.model.get_supported_languages():
                     language = probe_language
@@ -482,6 +503,8 @@ class TranscribeWorker(QThread):
                 language=language,
                 return_time_stamps=True,
             )
+            if self._stop:
+                return True
             # Qwen3ASRModel.transcribe is documented to return one result per
             # input, and zip() would silently drop regions if it ever didn't —
             # audio transcribed and then thrown away, with nothing to show for
@@ -552,6 +575,8 @@ class TranscribeWorker(QThread):
         track = self.tracks[i]
         self.track_started.emit(i)
         audio = decode_track_audio(track.path, track.stream_index, track.channel)
+        if self._stop:
+            return True
         duration = len(audio) / 16000
         for res in model.recognize(audio, sample_rate=16000):
             if self._stop:
@@ -566,6 +591,9 @@ class TranscribeWorker(QThread):
         return False
 
     def run(self) -> None:
+        if self._stop:
+            self.finished_all.emit(True)
+            return
         try:
             model = self._load_model()
         except Exception as exc:  # model download/load failure on every device tried
@@ -582,12 +610,16 @@ class TranscribeWorker(QThread):
             try:
                 cancelled = self._transcribe_track(model, i)
             except Exception as exc:
+                if self._stop:
+                    cancelled = True
+                    break
                 if self.device != "cpu":
                     # GPU trouble (e.g. out of VRAM) — spill this and later tracks to CPU.
                     self.model_status.emit(
                         f"GPU error on {self.tracks[i].path.name} ({exc}) — retrying on CPU…"
                     )
                     self.device = "cpu"
+                    model = None  # release the local GPU reference before reloading
                     try:
                         model = _get_model(self.model_name, self.device, self.model_status.emit)
                         cancelled = self._transcribe_track(model, i)

@@ -14,6 +14,11 @@ also locally.
 
 1. Double-click **`TransViber TransScriber.bat`** (or run
    `.venv\Scripts\python.exe app\main.py` from a terminal to see logs).
+   The batch file is the normal launcher for this source copy; no rebuild
+   is needed after changes to `app/`. The window opens before the background
+   GPU check finishes, without loading the AI engines. If opening still
+   takes unusually long, `app.log` beside the batch file records the click
+   time, Python startup, and the time the window becomes ready.
 2. Drag & drop audio into the window (or **Add Files…**). FLAC, M4A/AAC/MP4,
    MP3, WAV, OGG, Opus, MKA/MKV and more are supported. Either one file per
    speaker, or a single multitrack file:
@@ -38,6 +43,8 @@ also locally.
    transcript builds live in the lower pane. The **☆ button** beside either
    model dropdown pins the selected model as the startup default (★); unstar
    it and the app goes back to remembering whichever model you used last.
+   A loaded transcription model stays cached for repeat runs; changing the
+   model/device, starting AI Notes, or closing the app releases it.
 6. **Dark mode**: toggle the checkbox in the status bar (bottom right). It
    follows Windows' theme until you set it manually; then it's remembered.
 7. While transcribing, an **elapsed timer** runs next to the Transcribe

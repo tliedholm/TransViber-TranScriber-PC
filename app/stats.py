@@ -7,6 +7,8 @@ stutter the UI from a main-thread QTimer.
 
 from __future__ import annotations
 
+from threading import Event
+
 from PySide6.QtCore import QThread, Signal
 
 POLL_MS = 2000
@@ -48,16 +50,16 @@ class StatsPoller(QThread):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._stop = False
+        self._stop = Event()
 
     def stop(self) -> None:
-        self._stop = True
+        self._stop.set()
 
     def run(self) -> None:
         import psutil  # imported here, like every other non-Qt dependency
 
         psutil.cpu_percent(interval=None)  # prime the since-last-call counter
-        while not self._stop:
+        while not self._stop.is_set():
             parts = []
             gpu, vram = gpu_stats()
             if gpu is not None:
@@ -67,4 +69,15 @@ class StatsPoller(QThread):
             parts.append(f"CPU {psutil.cpu_percent(interval=None):.0f}%")
             parts.append(f"RAM {psutil.virtual_memory().percent:.0f}%")
             self.stats.emit(" · ".join(parts))
-            self.msleep(POLL_MS)
+            self._stop.wait(POLL_MS / 1000)
+
+
+class DeviceProbe(QThread):
+    """Keep driver initialization off the window's startup path."""
+
+    detected = Signal(bool)
+
+    def run(self) -> None:
+        from transcriber import cuda_available
+
+        self.detected.emit(cuda_available())
