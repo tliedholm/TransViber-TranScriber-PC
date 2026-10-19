@@ -191,6 +191,34 @@ This assumes all tracks start at the same moment (as multitrack recorders and
 apps like Craig/Audacity/REAPER produce). If a track is offset, align it in an
 editor first.
 
+## Setting up from source
+
+The repository holds only the source. The Python environment, the llama.cpp
+server and the model weights are left out (see `.gitignore`), so a fresh
+clone needs them recreated before the app runs. You need Windows, an NVIDIA
+GPU with a current driver, and Python 3.14.
+
+1. Create the venv and install the pinned packages. Install torch first,
+   from PyTorch's own index, so the CUDA build isn't replaced by the CPU one:
+
+   ```bat
+   py -3.14 -m venv .venv
+   .venv\Scripts\python.exe -m pip install --upgrade pip
+   .venv\Scripts\python.exe -m pip install torch==2.11.0+cu128 ^
+       --index-url https://download.pytorch.org/whl/cu128
+   .venv\Scripts\python.exe -m pip install -r requirements.lock.txt
+   ```
+
+2. For AI Notes, download the llama.cpp Windows CUDA x64 build (release
+   b10034 is the one this app was verified against) and its matching CUDA
+   runtime zip from the
+   [llama.cpp releases page](https://github.com/ggml-org/llama.cpp/releases),
+   then unzip both into a `llama-cpp\` folder at the project root so that
+   `llama-cpp\llama-server.exe` exists. Transcription works without it.
+
+3. Double-click **`TransViber TransScriber.bat`**. Transcription and notes
+   models download on first use.
+
 ## Setup notes (already done on this machine)
 
 - Python 3.14 venv in `.venv` with: `PySide6`, `faster-whisper`, `onnx-asr` +
