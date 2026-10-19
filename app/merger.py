@@ -19,8 +19,18 @@ MAX_COALESCE_CHARS = 1500
 
 
 def merge_tracks(tracks: list[Track]) -> list[Segment]:
-    """All segments from all tracks, ordered by start time."""
-    segments = [seg for track in tracks for seg in track.segments]
+    """All segments from all tracks, on the session clock, ordered by start time.
+
+    Segment times inside a track are relative to its own file; each track's
+    offset is added here, to copies, so the tracks keep their raw times and
+    the offset can never be applied twice — however often this runs or the
+    offset changes. What this returns is a view: editing it changes no
+    track. Python's sort is stable, so exact ties keep track order.
+    """
+    segments = [
+        Segment(seg.speaker, seg.start + track.offset, seg.end + track.offset, seg.text)
+        for track in tracks for seg in track.segments
+    ]
     segments.sort(key=lambda s: (s.start, s.end))
     return segments
 

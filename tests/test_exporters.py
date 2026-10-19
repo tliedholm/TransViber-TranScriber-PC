@@ -10,7 +10,8 @@ from pathlib import Path
 import tests  # noqa: F401  (puts app/ on sys.path)
 
 import exporters
-from models import Segment, Track, TrackStatus
+from merger import merge_tracks
+from models import OffsetSource, Segment, Track, TrackStatus
 
 
 SEGMENTS = [
@@ -56,6 +57,23 @@ class Formats(unittest.TestCase):
         self.assertEqual(data["model"], "qwen3-4b")
         self.assertEqual(len(data["segments"]), 2)
         self.assertEqual(data["tracks"][0]["status"], "Done")
+
+    def test_json_records_each_tracks_offset_and_how_it_was_set(self):
+        bob = Track(path=Path("bob.m4a"), speaker="Bob", offset=312.4567,
+                    offset_source=OffsetSource.MANUAL)
+        data = json.loads(exporters.to_json(SEGMENTS, TRACKS + [bob], ""))
+        self.assertEqual(data["tracks"][0]["offset"], 0.0)
+        self.assertEqual(data["tracks"][0]["offset_source"], "default")
+        self.assertEqual(data["tracks"][1]["offset"], 312.457)
+        self.assertEqual(data["tracks"][1]["offset_source"], "manual")
+
+    def test_offsets_reach_subtitle_times_through_the_merge(self):
+        bob = Track(path=Path("bob.m4a"), speaker="Bob", offset=150.25,
+                    segments=[Segment("Bob", 1.1, 2.4, "Hi.")])
+        srt = exporters.to_srt(merge_tracks([bob]))
+        vtt = exporters.to_vtt(merge_tracks([bob]))
+        self.assertIn("00:02:31,350 --> 00:02:32,650", srt)
+        self.assertIn("00:02:31.350 --> 00:02:32.650", vtt)
 
     def test_every_exporter_takes_the_same_arguments(self):
         """EXPORTERS[ext](segments, tracks, model) must work for every key."""

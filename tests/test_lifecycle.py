@@ -12,20 +12,23 @@ import tests  # noqa: F401
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QCloseEvent
-from PySide6.QtWidgets import QApplication
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QLineEdit
 
 import llm
 import main_window
 import transcriber
-from models import Segment, Track
+from models import OffsetSource, Segment, Track
 from stats import StatsPoller
 
 _app = QApplication.instance() or QApplication([])
 
 
-class WindowLifecycle(unittest.TestCase):
+class _WindowTest(unittest.TestCase):
+    """A real MainWindow with settings, notes and device probing isolated."""
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -46,6 +49,8 @@ class WindowLifecycle(unittest.TestCase):
         _app.processEvents()  # consume the deferred, mocked device probe
         self.window._on_device_detected(True)
 
+
+class WindowLifecycle(_WindowTest):
     def test_clear_catches_up_a_hidden_transcript_on_tab_switch(self):
         w = self.window
         w.show()
@@ -112,6 +117,130 @@ class WindowLifecycle(unittest.TestCase):
         item.setToolTip("old GPU error")
         self.window._set_status(0, "Pending")
         self.assertEqual(item.toolTip(), "")
+
+
+class OffsetColumn(_WindowTest):
+    """Typing in a track's Offset cell, through the table's own signal."""
+
+    def add(self, *tracks):
+        for track in tracks:
+            self.window.tracks.append(track)
+            self.window._append_row(track)
+
+    def offset_cell(self, row):
+        return self.window.table.item(row, main_window.COL_OFFSET)
+
+    def test_typing_an_offset_reorders_the_transcript(self):
+        w = self.window
+        w.show()
+        alice = Track(Path("alice.wav"), "Alice",
+                      segments=[Segment("Alice", 180, 181, "Three minutes in.")])
+        bob = Track(Path("bob.wav"), "Bob",
+                    segments=[Segment("Bob", 60, 61, "Sorry I'm late.")])
+        self.add(alice, bob)
+        w._render_transcript()
+        text = w.transcript_view.toPlainText()
+        self.assertLess(text.index("Sorry"), text.index("Three"))
+
+        self.offset_cell(1).setText("5:00")
+        self.assertEqual(bob.offset, 300.0)
+        self.assertEqual(bob.offset_source, OffsetSource.MANUAL)
+        w._render_transcript()
+        text = w.transcript_view.toPlainText()
+        self.assertLess(text.index("Three"), text.index("Sorry"))
+        self.assertIn("[6:00]", text)
+        self.assertEqual(bob.segments[0].start, 60)  # raw times stay raw
+
+    def test_a_bad_offset_is_rejected_and_the_old_value_stays(self):
+        bob = Track(Path("bob.wav"), "Bob")
+        self.add(bob)
+        self.offset_cell(0).setText("2:30")
+        self.offset_cell(0).setText("1:75")
+        self.assertEqual(bob.offset, 150.0)
+        self.assertEqual(self.offset_cell(0).text(), "2:30")
+        self.assertIn("under 60", self.window.statusBar().currentMessage())
+
+    def test_the_cell_is_rewritten_in_standard_form(self):
+        bob = Track(Path("bob.wav"), "Bob")
+        self.add(bob)
+        self.assertEqual(self.offset_cell(0).text(), "0:00")
+        self.assertIn("Not set", self.offset_cell(0).toolTip())
+        self.offset_cell(0).setText("150,5")
+        self.assertEqual(self.offset_cell(0).text(), "2:30.5")
+        self.assertIn("Typed by you", self.offset_cell(0).toolTip())
+
+    def test_a_typed_zero_counts_as_set_by_hand(self):
+        bob = Track(Path("bob.wav"), "Bob")
+        self.add(bob)
+        self.offset_cell(0).setText("0")
+        self.assertEqual(bob.offset, 0.0)
+        self.assertEqual(bob.offset_source, OffsetSource.MANUAL)
+
+    def type_into_offset_cell(self, row, keys):
+        """Open the cell's real editor, type `keys` (None: type nothing), press Enter."""
+        w = self.window
+        w.show()
+        w.table.editItem(self.offset_cell(row))
+        editor = w.table.viewport().findChild(QLineEdit)
+        self.assertIsNotNone(editor)
+        if keys is not None:
+            editor.selectAll()
+            QTest.keyClicks(editor, keys)
+        QTest.keyClick(editor, Qt.Key.Key_Return)
+        _app.processEvents()
+
+    def test_typing_in_the_real_editor_sets_the_offset(self):
+        bob = Track(Path("bob.wav"), "Bob")
+        self.add(bob)
+        self.type_into_offset_cell(0, "2:30,5")
+        self.assertEqual(bob.offset, 150.5)
+        self.assertEqual(self.offset_cell(0).text(), "2:30.5")
+
+    def test_retyping_the_shown_zero_counts_as_set_by_hand(self):
+        bob = Track(Path("bob.wav"), "Bob")
+        self.add(bob)
+        self.type_into_offset_cell(0, "0:00")
+        self.assertEqual(bob.offset_source, OffsetSource.MANUAL)
+        self.assertIn("Typed by you", self.offset_cell(0).toolTip())
+
+    def test_opening_and_closing_a_cell_without_typing_changes_nothing(self):
+        bob = Track(Path("bob.wav"), "Bob")
+        self.add(bob)
+        self.type_into_offset_cell(0, None)
+        self.assertEqual(bob.offset_source, OffsetSource.DEFAULT)
+
+    def test_an_absurd_offset_is_rejected_and_the_table_keeps_working(self):
+        bob = Track(Path("bob.wav"), "Bob")
+        self.add(bob)
+        self.offset_cell(0).setText("9" * 400)
+        self.assertEqual(bob.offset, 0.0)
+        self.assertEqual(self.offset_cell(0).text(), "0:00")
+        self.assertFalse(self.window.table.signalsBlocked())
+        self.offset_cell(0).setText("1:00")
+        self.assertEqual(bob.offset, 60.0)
+
+    def test_renaming_a_speaker_keeps_the_offset(self):
+        bob = Track(Path("bob.wav"), "Bob", segments=[Segment("Bob", 1, 2, "Hi.")])
+        self.add(bob)
+        self.offset_cell(0).setText("1:00")
+        self.window.table.item(0, main_window.COL_SPEAKER).setText("Robert")
+        self.assertEqual(bob.offset, 60.0)
+        self.window._render_transcript()
+        self.assertIn("Robert", self.window._transcript_blocks[0])
+        self.assertIn("[1:01]", self.window._transcript_blocks[0])
+
+    def test_splitting_a_track_keeps_its_offset(self):
+        track = Track(Path("room.wav"), "Room", offset=300.0,
+                      offset_source=OffsetSource.MANUAL)
+        self.add(track)
+        with patch("main_window.probe_streams",
+                   return_value=[{"channels": 2, "duration": 10.0}]):
+            self.window._split_track_channels(0)
+        self.assertEqual(len(self.window.tracks), 2)
+        for row, new in enumerate(self.window.tracks):
+            self.assertEqual(new.offset, 300.0)
+            self.assertEqual(new.offset_source, OffsetSource.MANUAL)
+            self.assertEqual(self.offset_cell(row).text(), "5:00")
 
 
 class WorkerLifecycle(unittest.TestCase):

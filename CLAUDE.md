@@ -134,8 +134,23 @@ merely to check whether it has anything to release.
 
 Each track is transcribed independently with VAD (silence while others talk
 is skipped, not hallucinated). Segments are tagged with the track's speaker,
-then **all** segments across tracks are sorted by start time. This assumes
-all tracks start at the same instant (as Craig/OBS/REAPER exports do).
+then **all** segments across tracks are sorted by start time.
+
+Tracks don't have to start at the same instant. Segment times inside a
+track stay relative to **its own file**; `Track.offset` is when that file
+began on the session clock (someone who joined late, or recorded on a
+separate device), and `merge_tracks` adds it to *copies* of the segments.
+So an offset edit never needs a re-transcription, can't be applied twice,
+and reaches the live view, AI notes and every export through that one
+function. Keep it there: don't bake an offset into `track.segments`. An
+offset is the file's start, not the first word — leading silence in a file
+is already correct timing. Offsets are never negative and never inferred
+from file length. With every offset at zero (Craig/OBS/REAPER exports, which
+pad late joiners), output is identical to before offsets existed.
+`OffsetSource` records how each was set (default, typed, matched, guessed);
+a typed value, including a typed 0, is the user's and is protected.
+`align.py` holds `parse_offset`/`format_offset` for the track table's
+editable **Offset** column.
 
 `SPLIT_GAP_SECONDS` (1.0s) is load-bearing: Whisper/Qwen can lump utterances
 separated by silence into one segment, which would sort a speaker's later
@@ -325,6 +340,9 @@ What is pinned, and why it is worth keeping pinned:
 - `test_exporters` — timestamp formats, VTT escaping, and `target_paths`
   (the "Session 2.5" case, where `with_suffix` would write a file the user
   never named).
+- `test_merger.Offsets` / `test_align` — the offset applied once, to copies,
+  with all-zero offsets giving exactly the old order; and every input form
+  the Offset column accepts or rejects, with its reason.
 - `test_llm` — catalog integrity, model resolution, and the identity policy,
   including that a typed `repo::file.gguf` gets the same policy as its
   alias. Prompt sizing is exercised through a `NotesWorker` subclass whose
@@ -339,6 +357,11 @@ What is pinned, and why it is worth keeping pinned:
   full redraw. Qt runs on the offscreen platform; the module sets
   `QT_QPA_PLATFORM` before importing `QtWidgets`, so leave that import order
   alone.
+- `test_lifecycle` — startup, clearing, caching and shutdown on a real
+  window (offscreen), plus the Offset column driven through its real cell
+  editor. Typed edits commit through `_OffsetDelegate`, not `itemChanged`:
+  Qt drops a write of unchanged text, and retyping the shown `0:00` is a
+  deliberate "starts at zero" that must still count as typed.
 
 Nothing here touches a GPU, a model or the network, and it should stay that
 way — `--selftest` is where real inference gets verified.

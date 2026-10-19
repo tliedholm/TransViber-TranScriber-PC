@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSplitter,
+    QStyledItemDelegate,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -40,9 +42,10 @@ from datetime import datetime
 import exporters
 import llm
 import runtime
+from align import format_offset, parse_offset
 from audio import channel_suffixes, probe_streams, tracks_for_file
 from merger import coalesce, merge_tracks
-from models import AUDIO_EXTENSIONS, Track, TrackStatus
+from models import AUDIO_EXTENSIONS, OffsetSource, Track, TrackStatus
 from stats import DeviceProbe, StatsPoller
 from transcriber import (
     TranscribeWorker,
@@ -73,7 +76,25 @@ LANGUAGES = [
     ("Turkish", "tr"),
 ]
 
-COL_SPEAKER, COL_FILE, COL_DURATION, COL_STATUS, COL_PROGRESS = range(5)
+COL_SPEAKER, COL_FILE, COL_DURATION, COL_OFFSET, COL_STATUS, COL_PROGRESS = range(6)
+
+OFFSET_HEADER_TIP = (
+    "When this recording started, measured from the start of the session.\n"
+    "Set it for someone who joined late: 2:30 puts all of their lines\n"
+    "2 minutes 30 seconds later. Leave it at 0:00 if the file already\n"
+    "includes the waiting time at the start.\n"
+    "\n"
+    "Type seconds (150), minutes:seconds (2:30) or hours:minutes:seconds\n"
+    "(1:02:30). The transcript re-orders straight away; nothing is\n"
+    "transcribed again. Type 0 to reset it."
+)
+
+OFFSET_SOURCE_TIPS = {
+    OffsetSource.DEFAULT: "Not set: assumed to start with the session.",
+    OffsetSource.MANUAL: "Typed by you.",
+    OffsetSource.MATCHED: "Found by Align from sound shared with another recording.",
+    OffsetSource.GUESS: "Align's guess: assumes this recorder stopped when the reference did.",
+}
 
 FILE_FILTER = "Audio files (*" + " *".join(sorted(AUDIO_EXTENSIONS)) + ");;All files (*.*)"
 
@@ -196,6 +217,28 @@ class _TranscriptPane:
             if not cursor.atStart() or cursor.block().length() > 1:
                 cursor.insertBlock()
             cursor.insertHtml(fragment)
+
+
+class _OffsetDelegate(QStyledItemDelegate):
+    """Hands a committed Offset edit straight to the window.
+
+    Going through the model would drop one edit that matters: retyping the
+    value a cell already shows — "0:00" over a default 0:00 — is a deliberate
+    "this one really starts at zero", but QTableWidgetItem ignores a write of
+    the text it already holds, so itemChanged never fires. A cell opened and
+    closed without typing is not an edit and is left alone.
+    """
+
+    def __init__(self, on_commit, parent=None) -> None:
+        super().__init__(parent)
+        self._on_commit = on_commit
+
+    def setModelData(self, editor, model, index) -> None:
+        if isinstance(editor, QLineEdit):
+            if editor.isModified():
+                self._on_commit(index.row(), editor.text())
+            return
+        super().setModelData(editor, model, index)
 
 
 class MainWindow(QMainWindow):
@@ -339,12 +382,17 @@ class MainWindow(QMainWindow):
         # Track table + transcript view (stacked on the right)
         right_splitter = QSplitter(Qt.Orientation.Vertical)
 
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Speaker", "File", "Duration", "Status", "Progress"])
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(
+            ["Speaker", "File", "Duration", "Offset", "Status", "Progress"])
+        self.table.horizontalHeaderItem(COL_OFFSET).setToolTip(OFFSET_HEADER_TIP)
+        self.table.setItemDelegateForColumn(
+            COL_OFFSET, _OffsetDelegate(self._on_offset_edited, self.table))
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(COL_SPEAKER, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(COL_FILE, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(COL_DURATION, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(COL_OFFSET, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(COL_STATUS, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(COL_PROGRESS, QHeaderView.ResizeMode.Fixed)
         self.table.setColumnWidth(COL_SPEAKER, 180)
@@ -650,6 +698,9 @@ class MainWindow(QMainWindow):
 
         speaker_item = QTableWidgetItem(track.speaker)
         self.table.setItem(row, COL_SPEAKER, speaker_item)
+        offset_item = QTableWidgetItem(format_offset(track.offset))
+        offset_item.setToolTip(OFFSET_SOURCE_TIPS[track.offset_source])
+        self.table.setItem(row, COL_OFFSET, offset_item)
 
         for col, text in [
             (COL_FILE, track.source_label),
@@ -668,7 +719,38 @@ class MainWindow(QMainWindow):
         self.table.setCellWidget(row, COL_PROGRESS, progress)
         self.table.blockSignals(False)
 
+    def _show_offset(self, row: int) -> None:
+        """Write a track's offset into its cell, in standard form."""
+        track = self.tracks[row]
+        item = self.table.item(row, COL_OFFSET)
+        was_blocked = self.table.blockSignals(True)
+        try:
+            item.setText(format_offset(track.offset))
+            item.setToolTip(OFFSET_SOURCE_TIPS[track.offset_source])
+        finally:
+            self.table.blockSignals(was_blocked)
+
+    def _on_offset_edited(self, row: int, text: str) -> None:
+        """Apply a committed Offset edit, or put the old value back."""
+        if not 0 <= row < len(self.tracks):
+            return
+        track = self.tracks[row]
+        try:
+            offset = parse_offset(text)
+        except ValueError as exc:
+            self.statusBar().showMessage(f"Offset not changed: {exc}", 8000)
+        else:
+            track.offset = offset
+            track.offset_source = OffsetSource.MANUAL
+            self._schedule_refresh()
+        self._show_offset(row)
+
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
+        if item.column() == COL_OFFSET:
+            # Edits typed in the cell arrive through _OffsetDelegate; this
+            # catches any other write to the item.
+            self._on_offset_edited(item.row(), item.text())
+            return
         if item.column() != COL_SPEAKER:
             return
         row = item.row()
@@ -715,7 +797,8 @@ class MainWindow(QMainWindow):
         for ch, suffix in enumerate(channel_suffixes(channels)):
             new = Track(path=track.path, speaker=track.speaker + suffix,
                         duration=track.duration, stream_index=track.stream_index,
-                        channel=ch)
+                        channel=ch, offset=track.offset,
+                        offset_source=track.offset_source)
             self.tracks.insert(row + ch, new)
             self._append_row(new, row + ch)
         self._schedule_refresh()

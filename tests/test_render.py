@@ -78,6 +78,16 @@ class IncrementalRender(unittest.TestCase):
         self.assertEqual(self.view.toPlainText(), rendered_whole(later))
         self.assertEqual(self.view.document().blockCount(), 3)
 
+    def test_an_offset_that_reorders_everything_matches_a_full_redraw(self):
+        """Typing an offset can move a speaker from first to last."""
+        before = [block("Bob", "0:05", "Sorry I'm late."), block("Alice", "0:40", "Hi."),
+                  block("Carl", "1:10", "Welcome.")]
+        after = [block("Alice", "0:40", "Hi."), block("Carl", "1:10", "Welcome."),
+                 block("Bob", "5:05", "Sorry I'm late.")]
+        self.feed([before, after])
+        self.assertEqual(self.view.toPlainText(), rendered_whole(after))
+        self.assertEqual(self.view.document().blockCount(), 3)
+
     def test_formatting_survives_the_append_path(self):
         self.feed([[block("Alice", "0:00", "One.")],
                    [block("Alice", "0:00", "One."), block("Bob", "0:12", "Two.")]])

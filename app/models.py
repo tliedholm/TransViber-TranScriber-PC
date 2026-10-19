@@ -7,6 +7,14 @@ from enum import Enum
 from pathlib import Path
 
 
+class OffsetSource(Enum):
+    """How a track's offset was set, shown in its Offset cell tooltip."""
+    DEFAULT = "default"   # never set; assumed to start with the session
+    MANUAL = "manual"     # typed by the user (including a typed 0)
+    MATCHED = "matched"   # applied from an Align sound match
+    GUESS = "guess"       # applied from Align's "stopped together" guess
+
+
 class TrackStatus(Enum):
     PENDING = "Pending"
     TRANSCRIBING = "Transcribing"
@@ -36,6 +44,11 @@ class Track:
     # within the container, and optionally a single channel of that stream.
     stream_index: int | None = None
     channel: int | None = None
+    # Seconds into the session at which this file began recording: non-zero
+    # when someone joined late or recorded on a separate device. Applied by
+    # merge_tracks, so segment times stay relative to the track's own file.
+    offset: float = 0.0
+    offset_source: OffsetSource = OffsetSource.DEFAULT
 
     @property
     def is_subtrack(self) -> bool:

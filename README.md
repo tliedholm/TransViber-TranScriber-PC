@@ -187,9 +187,15 @@ segments from all tracks by start time. For readable output (Markdown/text),
 consecutive segments from the same speaker are joined into one paragraph;
 SRT/VTT keep the fine-grained timing.
 
-This assumes all tracks start at the same moment (as multitrack recorders and
-apps like Craig/Audacity/REAPER produce). If a track is offset, align it in an
-editor first.
+Multitrack recorders and apps like Craig/Audacity/REAPER start every track
+at the same moment, so there is nothing to set. If someone recorded
+separately and joined late, set their track's **Offset**: when their file
+started, measured from the start of the session. Double-click the cell and
+type seconds (`150`), minutes:seconds (`2:30`) or hours:minutes:seconds
+(`1:02:30`); a comma works as the decimal point. Their lines move to the
+right place straight away, in the transcript and in every export, without
+transcribing again. Leave it at `0:00` if the file already contains the
+waiting time as silence at the start, and type `0` to reset it.
 
 ## Setting up from source
 
