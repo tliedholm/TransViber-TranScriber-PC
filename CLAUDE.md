@@ -83,11 +83,11 @@ shared `Track`/`Segment`/`TrackStatus` dataclasses.
 
 A `QTabWidget` with two tabs, both built in `_build_ui`:
 
-- **Transcribe** — control bar (files, model + ☆ star, language, device,
-  elapsed label, Transcribe/Export) over a horizontal splitter: the
+- **Transcribe** — control bar (files, Align…, model + ☆ star, language,
+  device, elapsed label, Transcribe/Export) over a horizontal splitter: the
   full-height **Vocabulary hints** panel on the left (shown only when
-  `engine_for(model)` is whisper or qwen), track table + live transcript on
-  the right.
+  `engine_for(model)` is whisper or qwen), and on the right the optional
+  session-reference row, the track table and the live transcript.
 - **Notes** — a vertical splitter: on top, the **AI instructions** panel
   beside the notes toolbar + editor; underneath, the full-width read-only
   transcript mirror. The toolbar's "Show: Instructions / Transcript"
@@ -111,9 +111,10 @@ mirror toggled off) is skipped and caught up by `_refresh_visible_panes`.
 
 Every long-running job is a `QThread` subclass communicating with the UI via
 Qt `Signal`s (never touch widgets off the main thread):
-`TranscribeWorker` (`transcriber.py`), `NotesWorker` (`llm.py`), and
-`StatsPoller` (`stats.py`, the GPU/VRAM/CPU/RAM status readout via NVML +
-psutil). `MainWindow` connects to their signals and updates widgets.
+`TranscribeWorker` (`transcriber.py`), `NotesWorker` (`llm.py`),
+`AlignWorker` (`align.py`), and `StatsPoller` (`stats.py`, the
+GPU/VRAM/CPU/RAM status readout via NVML + psutil). `MainWindow` connects
+to their signals and updates widgets.
 
 `DeviceProbe` checks CUDA through the driver API in a background thread
 after the window opens. Do not import CTranslate2/PyTorch to detect the GPU
@@ -134,13 +135,118 @@ merely to check whether it has anything to release.
 
 Each track is transcribed independently with VAD (silence while others talk
 is skipped, not hallucinated). Segments are tagged with the track's speaker,
-then **all** segments across tracks are sorted by start time. This assumes
-all tracks start at the same instant (as Craig/OBS/REAPER exports do).
+then **all** segments across tracks are sorted by start time.
+
+Tracks don't have to start at the same instant. Segment times inside a
+track stay relative to **its own file**; `Track.offset` is when that file
+began on the session clock (someone who joined late, or recorded on a
+separate device), and `merge_tracks` adds it to *copies* of the segments.
+So an offset edit never needs a re-transcription, can't be applied twice,
+and reaches the live view, AI notes and every export through that one
+function. Keep it there: don't bake an offset into `track.segments`. An
+offset is the file's start, not the first word — leading silence in a file
+is already correct timing. Offsets are never negative and never inferred
+from file length. With every offset at zero (Craig/OBS/REAPER exports, which
+pad late joiners), output is identical to before offsets existed.
+`OffsetSource` records how each was set (default, typed, matched, guessed);
+a typed value, including a typed 0, is the user's and is protected.
+`align.py` holds `parse_offset`/`format_offset` for the track table's
+editable **Offset** column, and Align (below) only ever proposes values for
+it.
 
 `SPLIT_GAP_SECONDS` (1.0s) is load-bearing: Whisper/Qwen can lump utterances
 separated by silence into one segment, which would sort a speaker's later
 remark at the time of their earlier one and break the interleaving. Segments
 are split at word-level silence gaps (`split_on_word_gaps`) to prevent this.
+
+### Track alignment
+
+**Align…** suggests offsets from sound the recordings share, and applies
+only what the user ticks in its review window (`AlignReviewDialog`). Nothing
+is ever applied automatically; a typed value is the undo.
+
+- **Evidence.** `AlignWorker` decodes each stream once through
+  `audio.iter_stream_power` at 8 kHz (a file is one unit: all its rows,
+  their streams' energies summed), keeping only a 100-per-second *onset
+  fingerprint*: the rises in log frame energy, less a 1 s moving average.
+  Power is summed over every channel, not taken from a mono downmix, which
+  gives an LFE-labelled channel (the 4th of 5.1) no weight — in a multitrack
+  file that channel can be someone's microphone. `find_offset` slides one
+  fingerprint along another with FFT normalised cross-correlation. The plan
+  specified loudness itself; rises replaced it because an isolated speaker
+  file and a mix share that speaker's syllable onsets while other voices
+  fill the mix, and loudness matched with its peak barely clear of its own
+  neighbourhood.
+- **Trust.** The label comes from peak ÷ best score more than 0.5 s away:
+  strong ≥ `MATCH_RATIO` (ticked), weak ≥ `WEAK_RATIO` (unticked), else no
+  match. Lags are only scored where the files overlap by
+  `MIN_OVERLAP_SECONDS` (120 s, or half the shorter file), and a strong
+  label needs `STRONG_MIN_OVERLAP_SECONDS` (240 s, or 90% of the shorter
+  file). The plan said 30 s; at 30–70 s of overlap unrelated files threw up
+  an occasional lone "strong" peak. Each file also needs
+  `MIN_ACTIVE_SECONDS` of sound inside the overlap: two gated headsets with a
+  few words each scored strong on chance coincidences alone. A second counts
+  as sound above both a tenth of the busiest seconds and `SOUND_ENERGY`, so
+  a file of hiss or digital silence has none, however loud its "busiest"
+  seconds. A strong match is then searched for again in parts of the
+  overlap (`_part_verdict`): the first and last third, sixth, twelfth and
+  80 s, each part on its own. Shrinking parts towards each end is what
+  reaches a cut near either end, where the bigger part straddling it mostly
+  agrees; one within about 40 s of an end is still missed (surveyed: 60 s or
+  more all caught, 30 s or less missed). A part is only scored at lags where
+  nearly all of it lies inside the reference, since a sliver of overlap at
+  the edge throws up chance peaks, and only once it holds
+  `MIN_ACTIVE_SECONDS` of sound itself. It downgrades the match when its
+  clear peak (≥ `WEAK_RATIO`) lands more than 0.1 s away, or when it has two
+  real peaks, neither clear of the other but both clear of everything else,
+  with the whole-file lag one of them: that is a part straddling a cut. A
+  part whose only standout is a chance peak, with the whole-file lag no
+  better than the rest, contradicts nothing. Against a session reference a
+  strong match also needs two separate stretches of the file's *active*
+  audio (20 s of it each, so silence never counts) to agree through the
+  same `_part_verdict`; a stretch that disagrees downgrades it whatever the
+  others say. `suggest_offsets` chains only through strong matches; a weak
+  one is kept as that file's suggestion, never replaced by the "stopped
+  together" guess and never used to place another file. Guesses start
+  unticked, and so does any file with a typed value on any of its rows.
+- **Session reference.** `MainWindow.session_reference` is a
+  `SessionReference`, deliberately not a `Track`: never transcribed,
+  exported, counted or sent to AI Notes. Its start is session 0:00 and
+  never moves; a file matched before it gets a reason and no checkbox.
+  Without one, the longest speaker file is the reference, anchored on its
+  current offset. If the reference or a strong match would land before
+  0:00, every row moves later by the same amount; weak rows never drive
+  that shift, and one still negative afterwards can't be applied.
+  `AlignmentResult.measured` keeps the rows relative to the reference so
+  `rebase()` can re-anchor without re-matching: the window does that when
+  the reference file's offset was typed while Align ran. When the clock
+  moves (a shift, or a file that starts ticked would move from an offset it
+  already has) and a file with an offset of its own (typed, or from an
+  earlier Align) would start unticked, nothing starts ticked, since applying
+  the others alone would leave that file behind on the old clock. An
+  automatic reference that doesn't move keeps its value, but turns MATCHED
+  from DEFAULT once others are applied against it, so the next run counts
+  it as placed. The same canonical path can't hold both roles (checked in
+  both import routes).
+- **Busy state.** `_tracks_locked()` covers transcription, alignment and
+  the review window: Add/Remove/Clear/split are disabled while any of them
+  runs, and the reference controls from Align until the review closes.
+  Offset edits, Transcribe and AI Notes stay available during Align. The
+  review waits for any other modal prompt to close first (Apply under an
+  open Export dialog would change what it is about to write), commits an
+  Offset still being typed before reading "Now", and Export merges again
+  right before each write.
+- **Calibration status.** The thresholds are provisional. On synthetic
+  energy sessions true matches scored about 3.3–24 and 1,200 unrelated
+  pairs at most 1.89 (some weak, none strong). Over about 12,000 unrelated
+  pairs the ratio alone reached 2.3, always at about 120 s of overlap: it is
+  the 240 s strong-overlap rule, not `MATCH_RATIO`, that keeps those weak,
+  so recalibrate the two together. On espeak-synthesised
+  four-speaker speech (compressed mix, late joiners, an early leaver),
+  isolated files against the mix scored 3.7–12.4 with every part agreeing,
+  same-room bleed 7.4–8.2 and unrelated headset files 1.08–1.25. None of
+  that is a real recording: calibrate on real sessions, mix-versus-isolated
+  kept separate from shared-room, before trusting them.
 
 ### Three ASR engines behind one interface
 
@@ -325,6 +431,13 @@ What is pinned, and why it is worth keeping pinned:
 - `test_exporters` — timestamp formats, VTT escaping, and `target_paths`
   (the "Session 2.5" case, where `with_suffix` would write a file the user
   never named).
+- `test_merger.Offsets` / `test_align` — the offset applied once, to copies,
+  with all-zero offsets giving exactly the old order; and every input form
+  the Offset column accepts or rejects, with its reason. `test_align` also
+  pins the matcher on synthetic sessions (lag direction, what is never
+  labelled strong, window agreement, the drift check), the chaining and
+  session-reference rules through a scripted matcher, the worker's failure
+  and cancel paths, and one real PyAV decode of WAVs it writes itself.
 - `test_llm` — catalog integrity, model resolution, and the identity policy,
   including that a typed `repo::file.gguf` gets the same policy as its
   alias. Prompt sizing is exercised through a `NotesWorker` subclass whose
@@ -339,6 +452,13 @@ What is pinned, and why it is worth keeping pinned:
   full redraw. Qt runs on the offscreen platform; the module sets
   `QT_QPA_PLATFORM` before importing `QtWidgets`, so leave that import order
   alone.
+- `test_lifecycle` — startup, clearing, caching and shutdown on a real
+  window (offscreen), plus the Offset column driven through its real cell
+  editor. Typed edits commit through `_OffsetDelegate`, not `itemChanged`:
+  Qt drops a write of unchanged text, and retyping the shown `0:00` is a
+  deliberate "starts at zero" that must still count as typed. `Alignment`
+  runs the real `AlignWorker` thread with `run()` scripted and plays the
+  review window by replacing only its `exec()`.
 
 Nothing here touches a GPU, a model or the network, and it should stay that
 way — `--selftest` is where real inference gets verified.

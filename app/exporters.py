@@ -103,6 +103,10 @@ def to_json(segments: list[Segment], tracks: list[Track] | None = None,
                 "language": t.language,
                 "stream": t.stream_index,
                 "channel": t.channel,
+                # Segment times below are session times: this track's own
+                # file times plus this offset.
+                "offset": round(t.offset, 3),
+                "offset_source": t.offset_source.value,
                 # A track that errored or was cancelled may still have
                 # segments — whatever was transcribed before it stopped. The
                 # status is the only thing marking that text as partial.

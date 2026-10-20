@@ -187,9 +187,28 @@ segments from all tracks by start time. For readable output (Markdown/text),
 consecutive segments from the same speaker are joined into one paragraph;
 SRT/VTT keep the fine-grained timing.
 
-This assumes all tracks start at the same moment (as multitrack recorders and
-apps like Craig/Audacity/REAPER produce). If a track is offset, align it in an
-editor first.
+Multitrack recorders and apps like Craig/Audacity/REAPER start every track
+at the same moment, so there is nothing to set. If someone recorded
+separately and joined late, set their track's **Offset**: when their file
+started, measured from the start of the session. Double-click the cell and
+type seconds (`150`), minutes:seconds (`2:30`) or hours:minutes:seconds
+(`1:02:30`); a comma works as the decimal point. Their lines move to the
+right place straight away, in the transcript and in every export, without
+transcribing again. Leave it at `0:00` if the file already contains the
+waiting time as silence at the start, and type `0` to reset it.
+
+**Align…** can work the offsets out for you from sound the recordings
+share: people in the same room, one voice picked up by another mic, or a
+recording of the whole session. Separately recorded headsets usually share
+no sound with each other, so for those, add a full-session recording (a
+call or room mix) with **Add session reference…** above the track list.
+It is used for timing only: it is never transcribed, its start counts as
+0:00, and the individual speaker files are still what gets transcribed.
+Align reads the files (no AI model, no GPU) and shows a review window:
+strong matches are ticked, weak matches and guesses are not, and nothing
+changes until you press **Apply**. When there is no shared sound to go on,
+the only suggestion is a labelled guess that every recorder stopped at the
+same moment; check it before ticking it.
 
 ## Setting up from source
 
