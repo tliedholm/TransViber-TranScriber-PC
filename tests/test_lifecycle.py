@@ -1,6 +1,9 @@
 """Startup, clearing, caching and shutdown regressions; no inference or GPU."""
 
+import json
 import os
+import threading
+import time
 import subprocess
 import sys
 import tempfile
@@ -12,14 +15,16 @@ import tests  # noqa: F401
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QLineEdit
+from PySide6.QtWidgets import QApplication, QDialog, QLineEdit
 
+import align
 import llm
 import main_window
 import transcriber
+from align import AUTOMATIC_REFERENCE, SESSION_REFERENCE, AlignmentResult, Suggestion
 from models import OffsetSource, Segment, Track
 from stats import StatsPoller
 
@@ -243,6 +248,607 @@ class OffsetColumn(_WindowTest):
             self.assertEqual(self.offset_cell(row).text(), "5:00")
 
 
+def _wait_until(condition, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError("timed out waiting for the window")
+        QTest.qWait(10)
+
+
+class Alignment(_WindowTest):
+    """Align from the window: what it locks, what the review offers, what Apply writes.
+
+    The worker is the real AlignWorker thread with its run() scripted, so the
+    signals cross threads as they do in the app; the review window is real
+    too, with only its exec() replaced so a test can play the user.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.folder = Path(self.temp.name)
+        for target, kwargs in (
+            ("main_window.tracks_for_file",
+             {"side_effect": lambda path: [Track(path, path.stem.title(), duration=600.0)]}),
+            ("main_window.probe_streams",
+             {"return_value": [{"channels": 1, "duration": 3600.0}]}),
+        ):
+            p = patch(target, **kwargs)
+            p.start()
+            self.addCleanup(p.stop)
+        self.info = self._patch("main_window.QMessageBox.information")
+        self.warning = self._patch("main_window.QMessageBox.warning")
+
+    def _patch(self, target):
+        p = patch(target)
+        mock = p.start()
+        self.addCleanup(p.stop)
+        return mock
+
+    def file(self, name):
+        path = self.folder / name
+        path.touch()
+        return path
+
+    def stereo(self, name):
+        """A file loaded as two rows, the way a split stereo track is."""
+        path = self.file(name)
+        for ch, suffix in enumerate((" L", " R")):
+            track = Track(path, path.stem.title() + suffix, duration=600.0, channel=ch)
+            self.window.tracks.append(track)
+            self.window._append_row(track)
+        return path
+
+    def align(self, rows, review=None, *, mode=AUTOMATIC_REFERENCE, reference=None,
+              note="", run=None):
+        """Press Align with the worker scripted to return `rows`, then play the
+        review window with `review(dialog) -> accepted`. Returns what was seen."""
+        seen = {"constructed": None, "dialogs": 0}
+        rows = list(rows)
+
+        class Scripted(align.AlignWorker):
+            def __init__(inner, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                seen["constructed"] = (inner.units, inner.session_reference)
+
+            def run(inner):
+                if run is not None:
+                    run(inner)
+                    return
+                ref = reference or rows[0].path
+                inner.finished_ok.emit(AlignmentResult(rows, mode, ref, note))
+
+        w = self.window
+
+        def play(dialog):
+            # The window deletes the dialog once it closes: keep what it showed.
+            seen["dialogs"] += 1
+            seen["basis"] = dialog.basis_label.text()
+            seen["cells"] = [[dialog.table.item(row, col).text() for col in range(5)]
+                             for row in range(dialog.table.rowCount())]
+            seen["locked_in_review"] = [not b.isEnabled() for b in (
+                w.btn_add, w.btn_remove, w.btn_clear, w.btn_reference,
+                w.btn_remove_reference, w.btn_align)]
+            seen["ticks"] = {s.path.name + f"#{i}": dialog.is_ticked(i)
+                             for i, s in enumerate(dialog.suggestions)}
+            return review(dialog) if review else False
+
+        with patch("main_window.AlignWorker", Scripted), \
+                patch.object(main_window.AlignReviewDialog, "exec", play):
+            w.toggle_alignment()
+            seen["while_running"] = {
+                "align_text": w.btn_align.text(),
+                "locked": [not b.isEnabled() for b in (
+                    w.btn_add, w.btn_remove, w.btn_clear, w.btn_reference,
+                    w.btn_remove_reference)],
+                "transcribe": w.btn_transcribe.isEnabled(),
+                "offset_editable": bool(w.table.item(0, main_window.COL_OFFSET).flags()
+                                        & Qt.ItemFlag.ItemIsEditable) if w.tracks else None,
+            }
+            _wait_until(lambda: w.align_worker is None and not w._align_reviewing)
+        return seen
+
+    def test_a_reference_alone_has_nothing_to_align_or_transcribe(self):
+        w = self.window
+        self.assertTrue(w.set_session_reference(self.file("session.wav")))
+        w.toggle_alignment()
+        self.assertIsNone(w.align_worker)
+        self.assertIn("Nothing to align", self.info.call_args.args[1])
+        w.toggle_transcription()
+        self.assertIsNone(w.worker)
+        self.assertEqual(self.info.call_args.args[1], "No tracks")
+        self.assertFalse(w.btn_export.isEnabled())
+        self.assertEqual(w.tracks, [])
+
+    def test_one_speaker_file_and_a_reference_can_align(self):
+        w = self.window
+        session, bob = self.file("session.wav"), self.file("bob.wav")
+        w.set_session_reference(session)
+        w.add_files([bob])
+        seen = self.align([Suggestion(bob, 900.0, "matched", "Matched sound with session.wav "
+                                      "(strong match)", "strong", session)],
+                          lambda dialog: True, mode=SESSION_REFERENCE, reference=session)
+        self.assertEqual(seen["constructed"], ([(bob, [None])], (session, [None])))
+        self.assertIn("Reference: session.wav; session starts at 0:00", seen["basis"])
+        self.assertEqual(w.tracks[0].offset, 900.0)
+        self.assertEqual(w.tracks[0].offset_source, OffsetSource.MATCHED)
+        self.assertEqual(w.table.item(0, main_window.COL_OFFSET).text(), "15:00")
+
+    def test_tracks_from_one_file_have_nothing_to_align(self):
+        self.stereo("room.wav")
+        self.window.toggle_alignment()
+        self.assertIsNone(self.window.align_worker)
+        self.assertIn("already in step", self.info.call_args.args[2])
+
+    def test_the_reference_cannot_also_be_a_speaker_file(self):
+        w = self.window
+        session = self.file("session.wav")
+        (self.folder / "sub").mkdir()
+        w.set_session_reference(session)
+        w.add_files([self.folder / "sub" / ".." / "session.wav"])
+        self.assertEqual(w.tracks, [])
+        self.assertIn("is the session reference", self.info.call_args.args[2])
+
+    def test_a_speaker_file_cannot_also_be_the_reference(self):
+        w = self.window
+        session, alice = self.file("session.wav"), self.file("alice.wav")
+        w.set_session_reference(session)
+        w.add_files([alice])
+        (self.folder / "sub").mkdir()
+        self.assertFalse(w.set_session_reference(self.folder / "sub" / ".." / "alice.wav"))
+        self.assertEqual(w.session_reference.path, session)
+        self.assertIn("Remove it from the track list first".lower(),
+                      self.info.call_args.args[2].lower())
+
+    def test_an_unreadable_reference_keeps_the_previous_one(self):
+        w = self.window
+        session = self.file("session.wav")
+        w.set_session_reference(session)
+        with patch("main_window.probe_streams", side_effect=OSError("not audio")):
+            self.assertFalse(w.set_session_reference(self.file("notes.wav")))
+        self.assertEqual(w.session_reference.path, session)
+        self.assertIn("not audio", self.warning.call_args.args[2])
+
+    def test_reference_controls_show_the_file_and_clear_removes_it(self):
+        w = self.window
+        w.show()
+        self.assertFalse(w.btn_remove_reference.isVisible())
+        w.set_session_reference(self.file("session.wav"))
+        self.assertEqual(w.btn_reference.text(), "Replace…")
+        self.assertTrue(w.btn_remove_reference.isVisible())
+        self.assertIn("session.wav", w.reference_label.text())
+        self.assertIn("1:00:00", w.reference_label.text())
+        self.assertIn("Timing reference only", w.reference_label.text())
+        w.clear_tracks()
+        self.assertIsNone(w.session_reference)
+        self.assertEqual(w.btn_reference.text(), "Add session reference…")
+        self.assertFalse(w.btn_remove_reference.isVisible())
+
+    def test_replacing_or_removing_the_reference_keeps_offsets(self):
+        w = self.window
+        w.add_files([self.file("bob.wav")])
+        w._on_offset_edited(0, "5:00")
+        w.set_session_reference(self.file("session.wav"))
+        w.set_session_reference(self.file("other.wav"))
+        self.assertEqual(w.session_reference.path.name, "other.wav")
+        w.remove_session_reference()
+        self.assertIsNone(w.session_reference)
+        self.assertEqual((w.tracks[0].offset, w.tracks[0].offset_source),
+                         (300.0, OffsetSource.MANUAL))
+
+    def test_the_reference_never_reaches_transcription(self):
+        w = self.window
+        w.set_session_reference(self.file("session.wav"))
+        w.add_files([self.file("bob.wav")])
+        with patch("main_window.TranscribeWorker") as worker_class, \
+                patch("main_window.llm.free_llm"):
+            w.toggle_transcription()
+        tracks, indices = worker_class.call_args.args
+        self.assertEqual([t.path.name for t in tracks], ["bob.wav"])
+        self.assertEqual(indices, [0])
+        w.worker = None
+        w._set_running(False)
+
+    def test_controls_stay_locked_through_alignment_and_review(self):
+        w = self.window
+        alice, bob = self.file("alice.wav"), self.file("bob.wav")
+        w.set_session_reference(self.file("session.wav"))
+        w.add_files([alice, bob])
+        seen = self.align([Suggestion(alice, 0.0, "matched", "m", "strong"),
+                           Suggestion(bob, 4.0, "matched", "m", "strong")],
+                          lambda dialog: False, mode=SESSION_REFERENCE)
+        running = seen["while_running"]
+        self.assertEqual(running["align_text"], "Cancel align")
+        self.assertEqual(running["locked"], [True] * 5)
+        self.assertTrue(running["transcribe"])        # no GPU or model involved
+        self.assertTrue(running["offset_editable"])   # typing an offset stays allowed
+        self.assertEqual(seen["locked_in_review"], [True] * 6)
+        for button in (w.btn_add, w.btn_remove, w.btn_clear, w.btn_reference,
+                       w.btn_remove_reference, w.btn_align):
+            self.assertTrue(button.isEnabled())
+        self.assertEqual(w.btn_align.text(), "Align…")
+
+    def test_shared_controls_wait_for_both_jobs(self):
+        w = self.window
+        w.add_files([self.file("alice.wav"), self.file("bob.wav")])
+        w.worker = Mock()
+        w._set_running(True)
+        w.align_worker = Mock()
+        w._update_busy()
+        w.worker = None
+        w._set_running(False)                 # transcription done, Align still running
+        self.assertFalse(w.btn_add.isEnabled())
+        w.add_files([self.file("carol.wav")])
+        self.assertEqual(len(w.tracks), 2)
+        w.align_worker = None
+        w._update_busy()
+        self.assertTrue(w.btn_add.isEnabled())
+
+    def test_strong_matches_start_ticked_and_apply_writes_every_row(self):
+        w = self.window
+        alice = self.file("alice.wav")
+        w.add_files([alice])
+        room = self.stereo("room.wav")
+        carol = self.file("carol.wav")
+        w.add_files([carol])
+        dave = self.file("dave.wav")
+        w.add_files([dave])
+        rows = [Suggestion(alice, 0.0, "reference", "Reference (longest recording)"),
+                Suggestion(room, 12.5, "matched", "strong", "strong", alice),
+                Suggestion(carol, 3.0, "matched", "weak", "weak", alice),
+                Suggestion(dave, 40.0, "guess", "Guess")]
+        seen = self.align(rows, lambda dialog: True)
+        self.assertEqual(list(seen["ticks"].values()), [True, True, False, False])
+        offsets = [(t.path.name, t.offset, t.offset_source) for t in w.tracks]
+        self.assertEqual(offsets, [
+            ("alice.wav", 0.0, OffsetSource.MATCHED),   # the anchor: room hangs from it
+            ("room.wav", 12.5, OffsetSource.MATCHED),
+            ("room.wav", 12.5, OffsetSource.MATCHED),
+            ("carol.wav", 0.0, OffsetSource.DEFAULT),
+            ("dave.wav", 0.0, OffsetSource.DEFAULT),
+        ])
+        self.assertEqual(w.table.item(2, main_window.COL_OFFSET).text(), "0:12.5")
+        self.assertIn("Applied 1 offset", w.statusBar().currentMessage())
+
+    def test_a_ticked_guess_is_recorded_as_a_guess(self):
+        w = self.window
+        alice, bob = self.file("alice.wav"), self.file("bob.wav")
+        w.add_files([alice, bob])
+
+        def tick_all(dialog):
+            for row in range(len(dialog.suggestions)):
+                dialog.set_ticked(row, True)
+            return True
+        self.align([Suggestion(alice, 0.0, "reference", "r"),
+                    Suggestion(bob, 40.0, "guess", "Guess")], tick_all)
+        self.assertEqual((w.tracks[1].offset, w.tracks[1].offset_source),
+                         (40.0, OffsetSource.GUESS))
+
+    def test_a_manual_value_on_any_row_protects_the_whole_file(self):
+        w = self.window
+        alice = self.file("alice.wav")
+        w.add_files([alice])
+        room = self.stereo("room.wav")
+        w._on_offset_edited(2, "0")            # a typed zero on the right channel
+        rows = [Suggestion(alice, 0.0, "reference", "r"),
+                Suggestion(room, 12.5, "matched", "Matched sound (strong match)", "strong")]
+        seen = self.align(rows, lambda dialog: True)
+        self.assertEqual(list(seen["ticks"].values()), [True, False])
+        self.assertIn("You set the current value", seen["cells"][1][4])
+        self.assertEqual([t.offset for t in w.tracks[1:]], [0.0, 0.0])
+
+        def accept_room(dialog):
+            dialog.set_ticked(1, True)
+            return True
+        self.align(rows, accept_room)
+        self.assertEqual([(t.offset, t.offset_source) for t in w.tracks[1:]],
+                         [(12.5, OffsetSource.MATCHED)] * 2)
+
+    def test_an_offset_typed_during_alignment_shows_as_current_and_manual(self):
+        w = self.window
+        alice, bob = self.file("alice.wav"), self.file("bob.wav")
+        w.add_files([alice, bob])
+        release = threading.Event()
+        rows = [Suggestion(alice, 0.0, "reference", "r"),
+                Suggestion(bob, 4.0, "matched", "m", "strong")]
+
+        def slow(worker):
+            release.wait(5)
+            worker.finished_ok.emit(AlignmentResult(rows, AUTOMATIC_REFERENCE, alice))
+
+        def typed_then_finish():
+            w._on_offset_edited(1, "1:00")
+            release.set()
+        QTimer.singleShot(0, typed_then_finish)
+        seen = self.align(rows, lambda dialog: True, run=slow)
+        self.assertEqual(seen["cells"][1][2], "1:00")
+        self.assertFalse(seen["ticks"]["bob.wav#1"])
+        self.assertEqual((w.tracks[1].offset, w.tracks[1].offset_source),
+                         (60.0, OffsetSource.MANUAL))
+
+    def test_cancel_in_the_review_window_changes_nothing(self):
+        w = self.window
+        alice, bob = self.file("alice.wav"), self.file("bob.wav")
+        w.add_files([alice, bob])
+        self.align([Suggestion(alice, 0.0, "reference", "r"),
+                    Suggestion(bob, 4.0, "matched", "m", "strong")], lambda dialog: False)
+        self.assertEqual([t.offset for t in w.tracks], [0.0, 0.0])
+        self.assertIn("No offsets were changed", w.statusBar().currentMessage())
+
+    def test_cancelling_alignment_changes_nothing(self):
+        w = self.window
+        w.add_files([self.file("alice.wav"), self.file("bob.wav")])
+
+        def until_stopped(worker):
+            while not worker._stop:
+                time.sleep(0.01)
+            worker.cancelled = True
+        QTimer.singleShot(0, w.toggle_alignment)   # press Cancel align
+        seen = self.align([], run=until_stopped)
+        self.assertEqual(seen["dialogs"], 0)
+        self.assertEqual([t.offset for t in w.tracks], [0.0, 0.0])
+        self.assertIn("cancelled", w.statusBar().currentMessage())
+        self.assertEqual(w.btn_align.text(), "Align…")
+
+    def test_a_failed_run_explains_and_changes_nothing(self):
+        w = self.window
+        w.set_session_reference(self.file("session.wav"))
+        w.add_files([self.file("alice.wav")])
+        message = "Couldn't use the session reference session.wav: no audio."
+        seen = self.align([], run=lambda worker: worker.failed.emit(message))
+        self.assertEqual(seen["dialogs"], 0)
+        self.assertEqual(self.warning.call_args.args[2], message)
+        self.assertEqual(w.tracks[0].offset, 0.0)
+        self.assertTrue(w.btn_reference.isEnabled())
+
+    def test_rows_that_cannot_apply_have_no_checkbox(self):
+        w = self.window
+        session, alice, bob = (self.file(n) for n in ("session.wav", "alice.wav", "bob.wav"))
+        w.set_session_reference(session)
+        w.add_files([alice, bob])
+        rows = [Suggestion(alice, -5.0, "matched", "Starts before the session reference by "
+                           "0:05 (strong match with session.wav)", "strong", session),
+                Suggestion(bob, None, "error", "Couldn't read it: bad header")]
+
+        def check(dialog):
+            self.assertFalse(dialog.is_checkable(0))
+            self.assertFalse(dialog.is_checkable(1))
+            self.assertEqual(dialog.table.item(0, dialog.COL_SUGGESTED).text(), "-0:05")
+            self.assertEqual(dialog.table.item(1, dialog.COL_SUGGESTED).text(), "—")
+            for row in range(2):
+                dialog.set_ticked(row, True)
+            return True
+        self.align(rows, check, mode=SESSION_REFERENCE, reference=session)
+        self.assertEqual([t.offset for t in w.tracks], [0.0, 0.0])
+
+    def test_an_offset_still_being_typed_counts_when_the_review_opens(self):
+        w = self.window
+        w.show()
+        alice, bob = self.file("alice.wav"), self.file("bob.wav")
+        w.add_files([alice, bob])
+        w.table.editItem(w.table.item(1, main_window.COL_OFFSET))
+        editor = w.table.viewport().findChild(QLineEdit)
+        editor.selectAll()
+        QTest.keyClicks(editor, "1:00")       # typed, Enter not pressed yet
+        seen = self.align([Suggestion(alice, 0.0, "reference", "r"),
+                           Suggestion(bob, 4.0, "matched", "m", "strong")], lambda dialog: True)
+        self.assertEqual(seen["cells"][1][2], "1:00")
+        self.assertFalse(seen["ticks"]["bob.wav#1"])
+        self.assertEqual((w.tracks[1].offset, w.tracks[1].offset_source),
+                         (60.0, OffsetSource.MANUAL))
+        self.assertIsNone(w._offset_delegate.open_editor)
+
+    def automatic(self, measured, anchor=0.0):
+        """The result an automatic-mode run hands over, anchored at `anchor`."""
+        return align.rebase(AlignmentResult([], AUTOMATIC_REFERENCE, measured[0].path,
+                                            measured=measured), anchor)
+
+    def run_while(self, result, during):
+        """A worker run that lets `during` happen on the main thread, then finishes."""
+        release = threading.Event()
+
+        def slow(worker):
+            release.wait(5)
+            worker.finished_ok.emit(result)
+
+        def act():
+            during()
+            release.set()
+        QTimer.singleShot(0, act)
+        return slow
+
+    def test_suggestions_follow_the_reference_offset_typed_during_alignment(self):
+        w = self.window
+        alice, bob = self.file("alice.wav"), self.file("bob.wav")
+        w.add_files([alice, bob])
+        result = self.automatic([Suggestion(alice, 0.0, "reference", "Reference"),
+                                 Suggestion(bob, 4.0, "matched", "m", "strong", alice)])
+        seen = self.align([], lambda dialog: True,
+                          run=self.run_while(result, lambda: w._on_offset_edited(0, "1:00")))
+        self.assertEqual([row[3] for row in seen["cells"]], ["1:00", "1:04"])
+        self.assertEqual([t.offset for t in w.tracks], [60.0, 64.0])
+        self.assertEqual(w.tracks[0].offset_source, OffsetSource.MANUAL)
+
+    def test_a_shift_past_a_typed_offset_leaves_everything_unticked(self):
+        w = self.window
+        alice, bob = self.file("alice.wav"), self.file("bob.wav")
+        w.add_files([alice, bob])
+        w._on_offset_edited(0, "0:20")
+        # bob started 10 s before alice; then alice is retyped to 0:05, which
+        # would put bob before 0:00, so every suggestion moves 5 s later.
+        result = self.automatic([Suggestion(alice, 0.0, "reference", "Reference"),
+                                 Suggestion(bob, -10.0, "matched", "m", "strong", alice)],
+                                anchor=20.0)
+        notes = []
+        seen = self.align([], lambda dialog: notes.append(dialog.note_label.text()) or True,
+                          run=self.run_while(result, lambda: w._on_offset_edited(0, "0:05")))
+        self.assertEqual([row[3] for row in seen["cells"]], ["0:10", "0:00"])
+        self.assertEqual(list(seen["ticks"].values()), [False, False])
+        self.assertIn("alice.wav's offset changed while Align ran", notes[0])
+        self.assertIn("moved 0:05 later", notes[0])
+        self.assertIn("Nothing is ticked yet: alice.wav already has an offset", notes[0])
+        self.assertEqual([(t.offset, t.offset_source) for t in w.tracks],
+                         [(5.0, OffsetSource.MANUAL), (0.0, OffsetSource.DEFAULT)])
+
+    def test_a_shift_past_an_earlier_guess_leaves_everything_unticked(self):
+        w = self.window
+        alice, bob, carol = (self.file(n) for n in ("alice.wav", "bob.wav", "carol.wav"))
+        w.add_files([alice, bob, carol])
+        w.tracks[2].offset, w.tracks[2].offset_source = 40.0, OffsetSource.GUESS
+        result = self.automatic([Suggestion(alice, 0.0, "reference", "Reference"),
+                                 Suggestion(bob, -30.0, "matched", "m", "strong", alice),
+                                 Suggestion(carol, 70.0, "guess", "Guess")])
+        notes = []
+        seen = self.align([], lambda dialog: notes.append(dialog.note_label.text()) or True,
+                          run=lambda worker: worker.finished_ok.emit(result))
+        self.assertEqual(list(seen["ticks"].values()), [False, False, False])
+        self.assertIn("carol.wav already has an offset", notes[0])
+        self.assertEqual([t.offset for t in w.tracks], [0.0, 0.0, 40.0])
+
+    def test_a_new_reference_keeps_an_earlier_run_together(self):
+        w = self.window
+        alice, bob = self.file("alice.wav"), self.file("bob.wav")
+        w.add_files([alice, bob])
+        self.align([Suggestion(alice, 0.0, "reference", "Reference"),
+                    Suggestion(bob, 10.0, "matched", "m", "strong", alice)], lambda dialog: True)
+        self.assertEqual([(t.offset, t.offset_source) for t in w.tracks],
+                         [(0.0, OffsetSource.MATCHED), (10.0, OffsetSource.MATCHED)])
+        # A longer recording comes in and becomes the reference; it places bob
+        # clearly but alice only weakly. Ticking bob alone would put the two
+        # 30 s apart where the first run measured 10.
+        room = self.file("room.wav")
+        w.add_files([room])
+        notes = []
+        seen = self.align([Suggestion(room, 0.0, "reference", "Reference"),
+                           Suggestion(alice, 20.0, "matched", "m", "weak", room),
+                           Suggestion(bob, 30.0, "matched", "m", "strong", room)],
+                          lambda dialog: notes.append(dialog.note_label.text()) or True)
+        self.assertEqual(list(seen["ticks"].values()), [False, False, False])
+        self.assertIn("alice.wav already has an offset", notes[0])
+        self.assertEqual([t.offset for t in w.tracks], [0.0, 10.0, 0.0])
+
+    def test_a_placed_file_that_starts_ticked_is_not_left_behind(self):
+        w = self.window
+        alice, bob, carol = (self.file(n) for n in ("alice.wav", "bob.wav", "carol.wav"))
+        w.add_files([alice, bob, carol])
+        w.tracks[1].offset, w.tracks[1].offset_source = 4.0, OffsetSource.MATCHED
+        result = self.automatic([Suggestion(alice, 0.0, "reference", "Reference"),
+                                 Suggestion(bob, -10.0, "matched", "m", "strong", alice),
+                                 Suggestion(carol, 3.0, "matched", "m", "weak", alice)])
+        notes = []
+        seen = self.align([], lambda dialog: notes.append(dialog.note_label.text()) or True,
+                          run=lambda worker: worker.finished_ok.emit(result))
+        self.assertEqual(list(seen["ticks"].values()), [True, True, False])
+        self.assertIn("Rows left unticked keep their current offsets", notes[0])
+        self.assertEqual([t.offset for t in w.tracks], [10.0, 0.0, 0.0])
+
+    def test_a_shift_with_nothing_typed_keeps_the_usual_ticks(self):
+        w = self.window
+        alice, bob, carol = (self.file(n) for n in ("alice.wav", "bob.wav", "carol.wav"))
+        w.add_files([alice, bob, carol])
+        result = self.automatic([Suggestion(alice, 0.0, "reference", "Reference"),
+                                 Suggestion(bob, -10.0, "matched", "m", "strong", alice),
+                                 Suggestion(carol, 3.0, "matched", "m", "weak", alice)])
+        notes = []
+        seen = self.align([], lambda dialog: notes.append(dialog.note_label.text()) or True,
+                          run=lambda worker: worker.finished_ok.emit(result))
+        self.assertEqual(list(seen["ticks"].values()), [True, True, False])
+        self.assertIn("Rows left unticked keep their current offsets", notes[0])
+        self.assertEqual([t.offset for t in w.tracks], [10.0, 0.0, 0.0])
+
+    def test_the_review_waits_for_another_open_prompt(self):
+        w = self.window
+        w.add_files([self.file("alice.wav"), self.file("bob.wav")])
+        prompt = QDialog(w)
+        prompt.setModal(True)
+        prompt.show()
+        QTimer.singleShot(400, prompt.close)
+        opened_over = []
+        self.align([Suggestion(w.tracks[0].path, 0.0, "reference", "r")],
+                   lambda dialog: opened_over.append(prompt.isVisible()) or False)
+        self.assertEqual(opened_over, [False])
+
+    def test_closing_while_the_review_waits_ends_it(self):
+        w = self.window
+        w.add_files([self.file("alice.wav"), self.file("bob.wav")])
+        prompt = QDialog(w)
+        prompt.setModal(True)
+        prompt.show()
+        QTimer.singleShot(100, lambda: (setattr(w, "_closing", True), prompt.close()))
+        seen = self.align([Suggestion(w.tracks[0].path, 0.0, "reference", "r")])
+        self.assertEqual(seen["dialogs"], 0)
+        self.assertFalse(w._align_reviewing)
+
+    def test_transcription_started_during_alignment_keeps_the_list_locked(self):
+        w = self.window
+        w.set_session_reference(self.file("session.wav"))
+        alice, bob = self.file("alice.wav"), self.file("bob.wav")
+        w.add_files([alice, bob])
+        worker_class = self._patch("main_window.TranscribeWorker")
+        self._patch("main_window.llm.free_llm")
+        result = AlignmentResult([Suggestion(alice, 0.0, "matched", "m", "strong"),
+                                  Suggestion(bob, 4.0, "matched", "m", "strong")],
+                                 SESSION_REFERENCE, w.session_reference.path)
+        self.align([], lambda dialog: True, mode=SESSION_REFERENCE,
+                   run=self.run_while(result, w.toggle_transcription))
+        tracks, indices = worker_class.call_args.args
+        self.assertEqual([t.path.name for t in tracks], ["alice.wav", "bob.wav"])
+        self.assertEqual(indices, [0, 1])
+        self.assertEqual(w.tracks[1].offset, 4.0)
+        for button in (w.btn_add, w.btn_remove, w.btn_clear):
+            self.assertFalse(button.isEnabled())   # transcription is still running
+        self.assertTrue(w.btn_reference.isEnabled())
+        w.worker = None
+        w._set_running(False)
+        self.assertTrue(w.btn_add.isEnabled())
+
+    def transcribed(self):
+        """A session reference plus one transcribed speaker, Bob."""
+        w = self.window
+        w.set_session_reference(self.file("session.wav"))
+        w.add_files([self.file("bob.wav")])
+        bob = w.tracks[0]
+        bob.segments.append(Segment("Bob", 1.0, 2.0, "Hello there."))
+        bob.status = main_window.TrackStatus.DONE
+        return bob
+
+    def test_the_reference_never_reaches_ai_notes(self):
+        w = self.window
+        self.transcribed()
+        with patch("main_window.llm.NotesWorker") as notes_class:
+            w.toggle_ai_notes()
+        self.assertEqual(notes_class.call_args.args[0].strip(), "[0:01] Bob: Hello there.")
+        w.notes_worker = None
+
+    def test_the_reference_never_reaches_exports_and_offsets_are_read_at_write(self):
+        w = self.window
+        bob = self.transcribed()
+        target = self.folder / "out.json"
+
+        def save_dialog(*_args):
+            bob.offset = 5.0     # an offset that changed while the dialog was open
+            return str(target), "JSON (*.json)"
+        with patch("main_window.QFileDialog.getSaveFileName", side_effect=save_dialog):
+            w.export_dialog()
+        data = json.loads(target.read_text(encoding="utf-8"))
+        self.assertEqual([t["file"] for t in data["tracks"]], [str(bob.path)])
+        self.assertEqual(data["segments"][0]["start"], 6.0)
+
+    def test_close_waits_for_a_running_alignment(self):
+        worker = Mock()
+        worker.isRunning.return_value = True
+        self.window.align_worker = worker
+        event = QCloseEvent()
+        self.window.closeEvent(event)
+        self.assertFalse(event.isAccepted())
+        worker.stop.assert_called_once()
+        worker.isRunning.return_value = False
+        final_event = QCloseEvent()
+        self.window.closeEvent(final_event)
+        self.assertTrue(final_event.isAccepted())
+        self.window.align_worker = None
+
+
 class WorkerLifecycle(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "win32", "Windows windowed launcher")
     def test_pythonw_source_launch_records_startup_errors_and_timings(self):
@@ -263,7 +869,7 @@ class WorkerLifecycle(unittest.TestCase):
     def test_interface_import_does_not_load_inference_libraries(self):
         code = (
             "import sys; sys.path.insert(0, 'app'); import main_window; "
-            "heavy = {'torch', 'ctranslate2', 'numpy', 'faster_whisper', 'onnxruntime'}; "
+            "heavy = {'torch', 'ctranslate2', 'numpy', 'faster_whisper', 'onnxruntime', 'av'}; "
             "assert not heavy.intersection(sys.modules), heavy.intersection(sys.modules)"
         )
         result = subprocess.run([sys.executable, "-c", code],

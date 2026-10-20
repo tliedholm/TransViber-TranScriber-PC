@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import os
 import time
 from pathlib import Path
 
@@ -14,8 +15,12 @@ from PySide6.QtGui import (
     QTextCursor,
 )
 from PySide6.QtWidgets import (
+    QAbstractItemDelegate,
+    QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -42,10 +47,18 @@ from datetime import datetime
 import exporters
 import llm
 import runtime
-from align import format_offset, parse_offset
+from align import (
+    CONSISTENCY_SECONDS,
+    SESSION_REFERENCE,
+    AlignmentResult,
+    AlignWorker,
+    format_offset,
+    parse_offset,
+    rebase,
+)
 from audio import channel_suffixes, probe_streams, tracks_for_file
 from merger import coalesce, merge_tracks
-from models import AUDIO_EXTENSIONS, OffsetSource, Track, TrackStatus
+from models import AUDIO_EXTENSIONS, OffsetSource, SessionReference, Track, TrackStatus
 from stats import DeviceProbe, StatsPoller
 from transcriber import (
     TranscribeWorker,
@@ -96,6 +109,20 @@ OFFSET_SOURCE_TIPS = {
     OffsetSource.GUESS: "Align's guess: assumes this recorder stopped when the reference did.",
 }
 
+ALIGN_TIP = (
+    "Work out when each speaker file started, from sound the recordings\n"
+    "share: a session reference, the same room, or one voice picked up by\n"
+    "another mic. Nothing changes until you review the suggestions and\n"
+    "press Apply; you can still edit any offset afterwards."
+)
+
+REFERENCE_TIP = (
+    "Optional: one recording of the whole session, such as a call or room\n"
+    "mix, for Align to time every speaker file against. Its start is\n"
+    "session 0:00. It is used for timing only: never transcribed, exported\n"
+    "or sent to AI Notes. The speaker files are still what gets transcribed."
+)
+
 FILE_FILTER = "Audio files (*" + " *".join(sorted(AUDIO_EXTENSIONS)) + ");;All files (*.*)"
 
 EXPORT_FILTERS = (
@@ -109,6 +136,16 @@ def _fmt_duration(seconds: float) -> str:
     h, rem = divmod(s, 3600)
     m, s = divmod(rem, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _canonical(path: Path) -> str:
+    """One spelling per file, so the same recording can't be loaded in two
+    roles under different names (letter case, a relative path, a link)."""
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path.absolute()
+    return os.path.normcase(str(resolved))
 
 
 def _add_grouped_models(combo: QComboBox,
@@ -232,6 +269,23 @@ class _OffsetDelegate(QStyledItemDelegate):
     def __init__(self, on_commit, parent=None) -> None:
         super().__init__(parent)
         self._on_commit = on_commit
+        self.open_editor = None
+
+    def createEditor(self, parent, option, index):
+        self.open_editor = super().createEditor(parent, option, index)
+        return self.open_editor
+
+    def destroyEditor(self, editor, index) -> None:
+        if editor is self.open_editor:
+            self.open_editor = None
+        super().destroyEditor(editor, index)
+
+    def finish_open_edit(self) -> None:
+        """Commit and close an editor still open, as clicking elsewhere would."""
+        editor = self.open_editor
+        if editor is not None:
+            self.commitData.emit(editor)
+            self.closeEditor.emit(editor, QAbstractItemDelegate.EndEditHint.NoHint)
 
     def setModelData(self, editor, model, index) -> None:
         if isinstance(editor, QLineEdit):
@@ -239,6 +293,143 @@ class _OffsetDelegate(QStyledItemDelegate):
                 self._on_commit(index.row(), editor.text())
             return
         super().setModelData(editor, model, index)
+
+
+class AlignReviewDialog(QDialog):
+    """Align's suggestions, one row per speaker file. Applies nothing itself.
+
+    Strong matches start ticked; weak matches, guesses and anything you typed
+    yourself start unticked, and a suggestion that can't be applied (an
+    unreadable file, a start before the session reference) has no checkbox.
+    If the clock moves (every suggestion shifted later, or a file placed
+    before would move) and a file that already has an offset would start
+    unticked, nothing starts ticked. "Now" is read when the window opens, so an offset typed while Align ran
+    shows as current, and, being typed, protects its row.
+    """
+
+    COL_APPLY, COL_FILE, COL_NOW, COL_SUGGESTED, COL_HOW = range(5)
+
+    def __init__(self, result: AlignmentResult, tracks: list[Track], parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Align: review suggested offsets")
+        self.suggestions = result.suggestions
+        layout = QVBoxLayout(self)
+        if result.mode == SESSION_REFERENCE:
+            basis = (f"Reference: {result.reference.name}; session starts at 0:00; "
+                     f"used for timing only.")
+        else:
+            basis = (f"No session reference: matched against {result.reference.name}, "
+                     f"the longest recording.")
+        self.basis_label = QLabel(basis)
+        self.basis_label.setWordWrap(True)
+        layout.addWidget(self.basis_label)
+        # When the clock moves — every suggestion shifted later, or a file an
+        # earlier run placed would move — a file that already has an offset
+        # (typed, or from that earlier run) and isn't ticked would stay where
+        # it is while the rest move, so then nothing starts ticked.
+        rows_of = {s.path: [t for t in tracks if t.path == s.path] for s in self.suggestions}
+        ticked = [s for s in self.suggestions if self._starts_ticked(s, rows_of[s.path])]
+
+        def placed(s) -> bool:
+            return any(t.offset_source is not OffsetSource.DEFAULT for t in rows_of[s.path])
+        left_behind = [s.path.name for s in self.suggestions if s not in ticked and placed(s)]
+        clock_moved = bool(result.shift) or any(
+            placed(s) and any(abs(t.offset - s.offset) > CONSISTENCY_SECONDS
+                              for t in rows_of[s.path]) for s in ticked)
+        self._default_ticks = not (clock_moved and left_behind)
+        note = result.note
+        if not self._default_ticks:
+            names = ", ".join(left_behind)
+            note += (f" Nothing is ticked yet: {names} already "
+                     f"{'have offsets' if len(left_behind) > 1 else 'has an offset'}, and "
+                     f"applying only the others would leave "
+                     f"{'them' if len(left_behind) > 1 else 'it'} out of step.")
+        elif result.shift:
+            note += " Rows left unticked keep their current offsets."
+        self.note_label = QLabel(note.strip())
+        self.note_label.setWordWrap(True)
+        self.note_label.setVisible(bool(note.strip()))
+        layout.addWidget(self.note_label)
+
+        self.table = QTableWidget(len(self.suggestions), 5)
+        self.table.setHorizontalHeaderLabels(
+            ["Apply", "File", "Now", "Suggested", "How it was found"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        header = self.table.horizontalHeader()
+        for col in range(4):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(self.COL_HOW, QHeaderView.ResizeMode.Stretch)
+        for row, suggestion in enumerate(self.suggestions):
+            self._fill_row(row, suggestion, rows_of[suggestion.path])
+        layout.addWidget(self.table)
+
+        hint = QLabel("Ticked rows go into the Offset column, where you can still change "
+                      "them. Cancel changes nothing.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                   | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Apply")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.resize(860, 160 + 30 * len(self.suggestions))
+
+    @staticmethod
+    def _starts_ticked(suggestion, rows: list[Track]) -> bool:
+        """Strong matches and the reference, unless you typed the file's offset."""
+        return (suggestion.applicable and bool(rows)
+                and not any(t.offset_source is OffsetSource.MANUAL for t in rows)
+                and (suggestion.method == "reference" or suggestion.strength == "strong"))
+
+    def _fill_row(self, row: int, suggestion, rows: list[Track]) -> None:
+        manual = any(t.offset_source is OffsetSource.MANUAL for t in rows)
+        offsets = {t.offset for t in rows}
+        if not rows:
+            now = "removed"
+        elif len(offsets) == 1:
+            now = format_offset(rows[0].offset)
+        else:
+            now = "varies"
+        reason = suggestion.reason
+        if manual:
+            reason += ". You set the current value"
+
+        apply_item = QTableWidgetItem()
+        apply_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+        if suggestion.applicable and rows:
+            apply_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+            ticked = self._default_ticks and self._starts_ticked(suggestion, rows)
+            apply_item.setCheckState(Qt.CheckState.Checked if ticked else Qt.CheckState.Unchecked)
+        self.table.setItem(row, self.COL_APPLY, apply_item)
+        suggested = format_offset(suggestion.offset) if suggestion.offset is not None else "—"
+        for col, text in ((self.COL_FILE, suggestion.path.name), (self.COL_NOW, now),
+                          (self.COL_SUGGESTED, suggested), (self.COL_HOW, reason)):
+            item = QTableWidgetItem(text)
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            if col == self.COL_FILE:
+                item.setToolTip(str(suggestion.path))
+            elif col == self.COL_HOW:
+                item.setToolTip(reason)
+            self.table.setItem(row, col, item)
+
+    def is_checkable(self, row: int) -> bool:
+        return bool(self.table.item(row, self.COL_APPLY).flags()
+                    & Qt.ItemFlag.ItemIsUserCheckable)
+
+    def is_ticked(self, row: int) -> bool:
+        return (self.is_checkable(row) and
+                self.table.item(row, self.COL_APPLY).checkState() == Qt.CheckState.Checked)
+
+    def set_ticked(self, row: int, ticked: bool) -> None:
+        if self.is_checkable(row):
+            self.table.item(row, self.COL_APPLY).setCheckState(
+                Qt.CheckState.Checked if ticked else Qt.CheckState.Unchecked)
+
+    def chosen(self) -> list:
+        return [s for row, s in enumerate(self.suggestions) if self.is_ticked(row)]
 
 
 class MainWindow(QMainWindow):
@@ -251,6 +442,12 @@ class MainWindow(QMainWindow):
         self.tracks: list[Track] = []
         self.worker: TranscribeWorker | None = None
         self.notes_worker: llm.NotesWorker | None = None
+        # Align's timing-only file: never a Track, so never transcribed.
+        self.session_reference: SessionReference | None = None
+        self.align_worker: AlignWorker | None = None
+        self._align_reviewing = False
+        self._align_result: AlignmentResult | None = None
+        self._align_error = ""
         self.has_cuda: bool | None = None
         self._closing = False
         self._notes_load_failed = False
@@ -290,9 +487,13 @@ class MainWindow(QMainWindow):
         self.btn_remove.clicked.connect(self.remove_selected)
         self.btn_clear = QPushButton("Clear")
         self.btn_clear.clicked.connect(self.clear_tracks)
+        self.btn_align = QPushButton("Align…")
+        self.btn_align.setToolTip(ALIGN_TIP)
+        self.btn_align.clicked.connect(self.toggle_alignment)
         bar.addWidget(self.btn_add)
         bar.addWidget(self.btn_remove)
         bar.addWidget(self.btn_clear)
+        bar.addWidget(self.btn_align)
         bar.addSpacing(20)
 
         bar.addWidget(QLabel("Model:"))
@@ -386,8 +587,8 @@ class MainWindow(QMainWindow):
         self.table.setHorizontalHeaderLabels(
             ["Speaker", "File", "Duration", "Offset", "Status", "Progress"])
         self.table.horizontalHeaderItem(COL_OFFSET).setToolTip(OFFSET_HEADER_TIP)
-        self.table.setItemDelegateForColumn(
-            COL_OFFSET, _OffsetDelegate(self._on_offset_edited, self.table))
+        self._offset_delegate = _OffsetDelegate(self._on_offset_edited, self.table)
+        self.table.setItemDelegateForColumn(COL_OFFSET, self._offset_delegate)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(COL_SPEAKER, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(COL_FILE, QHeaderView.ResizeMode.Stretch)
@@ -402,7 +603,26 @@ class MainWindow(QMainWindow):
         self.table.itemChanged.connect(self._on_item_changed)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_table_menu)
-        right_splitter.addWidget(self.table)
+
+        # Optional session reference: a timing-only file kept out of the table.
+        reference_row = QHBoxLayout()
+        self.btn_reference = QPushButton("Add session reference…")
+        self.btn_reference.setToolTip(REFERENCE_TIP)
+        self.btn_reference.clicked.connect(self.choose_session_reference)
+        self.reference_label = QLabel()
+        self.reference_label.setToolTip(REFERENCE_TIP)
+        self.btn_remove_reference = QPushButton("Remove reference")
+        self.btn_remove_reference.clicked.connect(self.remove_session_reference)
+        reference_row.addWidget(self.btn_reference)
+        reference_row.addWidget(self.reference_label, 1)
+        reference_row.addWidget(self.btn_remove_reference)
+        tracks_box = QWidget()
+        tracks_col = QVBoxLayout(tracks_box)
+        tracks_col.setContentsMargins(0, 0, 0, 0)
+        tracks_col.addLayout(reference_row)
+        tracks_col.addWidget(self.table)
+        right_splitter.addWidget(tracks_box)
+        self._show_session_reference()
 
         self.transcript_view = QTextBrowser()
         self.transcript_view.setOpenExternalLinks(False)
@@ -659,7 +879,7 @@ class MainWindow(QMainWindow):
     # ---------- Drag & drop ----------
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if self.worker is None and any(
+        if not self._tracks_locked() and any(
             Path(u.toLocalFile()).suffix.lower() in AUDIO_EXTENSIONS
             for u in event.mimeData().urls()
         ):
@@ -680,15 +900,31 @@ class MainWindow(QMainWindow):
         self.add_files([Path(f) for f in files])
 
     def add_files(self, paths: list[Path]) -> None:
-        existing = {t.path for t in self.tracks}
+        if self._tracks_locked():
+            return
+        existing = {_canonical(t.path) for t in self.tracks}
+        reference = self.session_reference
+        reference_key = _canonical(reference.path) if reference is not None else None
+        refused = None
         for path in paths:
-            if path in existing or not path.is_file():
+            key = _canonical(path)
+            if key in existing or not path.is_file():
+                continue
+            if key == reference_key:
+                refused = path
                 continue
             for track in tracks_for_file(path):
                 self.tracks.append(track)
                 self._append_row(track)
-            existing.add(path)
+            existing.add(key)
         self.statusBar().showMessage(f"{len(self.tracks)} track(s) loaded")
+        if refused is not None:
+            QMessageBox.information(
+                self, "That's the session reference",
+                f"{refused.name} is the session reference, which is used for timing "
+                f"only and never transcribed, so it can't also be a speaker file.\n\n"
+                f"To transcribe it, click Remove reference above the track list, "
+                f"then add it again.")
 
     def _append_row(self, track: Track, row: int | None = None) -> None:
         if row is None:
@@ -764,7 +1000,7 @@ class MainWindow(QMainWindow):
 
     def _show_table_menu(self, pos) -> None:
         row = self.table.rowAt(pos.y())
-        if row < 0 or self.worker is not None:
+        if row < 0 or self._tracks_locked():
             return
         track = self.tracks[row]
         menu = QMenu(self)
@@ -804,7 +1040,7 @@ class MainWindow(QMainWindow):
         self._schedule_refresh()
 
     def remove_selected(self) -> None:
-        if self.worker is not None:
+        if self._tracks_locked():
             return
         rows = sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True)
         for row in rows:
@@ -813,13 +1049,257 @@ class MainWindow(QMainWindow):
         self._schedule_refresh()
 
     def clear_tracks(self) -> None:
-        if self.worker is not None:
+        if self._tracks_locked():
             return
         self.table.setRowCount(0)
         self.tracks.clear()
+        self.session_reference = None
+        self._show_session_reference()
         self._refresh_timer.stop()
         self._render_transcript()
         self.btn_export.setEnabled(False)
+
+    # ---------- Session reference ----------
+
+    def choose_session_reference(self) -> None:
+        if self._aligning():
+            return
+        file, _ = QFileDialog.getOpenFileName(
+            self, "Choose a recording of the whole session", "", FILE_FILTER)
+        if file:
+            self.set_session_reference(Path(file))
+
+    def set_session_reference(self, path: Path) -> bool:
+        """Use `path` as Align's session reference, or say why not and keep the old one."""
+        if self._aligning():
+            return False
+        key = _canonical(path)
+        if any(_canonical(t.path) == key for t in self.tracks):
+            QMessageBox.information(
+                self, "Already a speaker file",
+                f"{path.name} is in the track list as a speaker file, so it can't "
+                f"also be the session reference.\n\nTo use it as the reference, "
+                f"remove it from the track list first.")
+            return False
+        try:
+            streams = probe_streams(path)
+            if not streams:
+                raise ValueError("it has no audio in it")
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Can't use that file",
+                f"{path.name} can't be read as audio: {exc}\n\n"
+                f"The session reference was not changed.")
+            return False
+        self.session_reference = SessionReference(
+            path, max(s["duration"] for s in streams), len(streams))
+        self._show_session_reference()
+        self.statusBar().showMessage(
+            f"Session reference: {path.name}. Click Align… to time the speaker "
+            f"files against it; offsets already set stay as they are.", 10000)
+        return True
+
+    def remove_session_reference(self) -> None:
+        if self._aligning() or self.session_reference is None:
+            return
+        self.session_reference = None
+        self._show_session_reference()
+        self.statusBar().showMessage(
+            "Session reference removed. Offsets already set stay as they are.", 8000)
+
+    def _show_session_reference(self) -> None:
+        reference = self.session_reference
+        if reference is None:
+            self.reference_label.setText(
+                "<span style='color:gray'>Optional: a recording of the whole session "
+                "for Align to time the speaker files against.</span>")
+        else:
+            self.reference_label.setText(
+                f"<b>{html.escape(reference.path.name)}</b> "
+                f"({_fmt_duration(reference.duration)}) — Timing reference only; "
+                f"individual files are transcribed")
+        self.btn_reference.setText("Replace…" if reference else "Add session reference…")
+        self.btn_remove_reference.setVisible(reference is not None)
+        self._update_busy()
+
+    # ---------- Busy state ----------
+
+    def _aligning(self) -> bool:
+        """From Align until its review window closes: the reference stays put,
+        so the review's "Reference:" line still names what it was matched to."""
+        return self.align_worker is not None or self._align_reviewing
+
+    def _tracks_locked(self) -> bool:
+        """Whether the track list must stay as it is: transcription indexes into
+        it, and Align's results are matched back to it by path."""
+        return self.worker is not None or self._aligning()
+
+    def _update_busy(self) -> None:
+        """Enable the controls the running jobs share; either job can lock them."""
+        locked = self._tracks_locked()
+        for widget in (self.btn_add, self.btn_remove, self.btn_clear):
+            widget.setEnabled(not locked)
+        aligning = self._aligning()
+        self.btn_reference.setEnabled(not aligning)
+        self.btn_remove_reference.setEnabled(not aligning)
+        if self.align_worker is None:
+            self.btn_align.setText("Align…")
+            self.btn_align.setEnabled(not self._align_reviewing)
+
+    # ---------- Alignment ----------
+
+    def _alignment_units(self) -> list[tuple[Path, list[int | None]]]:
+        """One (path, streams) pair per speaker file: its rows are already in
+        step with each other, so the file is matched once, as a whole."""
+        units: dict[Path, list[int | None]] = {}
+        for track in self.tracks:
+            streams = units.setdefault(track.path, [])
+            if track.stream_index not in streams:
+                streams.append(track.stream_index)
+        return list(units.items())
+
+    def toggle_alignment(self) -> None:
+        if self._closing or self._align_reviewing:
+            return
+        if self.align_worker is not None:
+            self.btn_align.setEnabled(False)
+            self.btn_align.setText("Cancelling…")
+            self.align_worker.stop()
+            return
+        units = self._alignment_units()
+        reference = self.session_reference
+        if not units:
+            QMessageBox.information(
+                self, "Nothing to align",
+                "Add the speaker files first. Align works out when each one started, "
+                "from sound they share with each other or with a session reference.")
+            return
+        if reference is None and len(units) < 2:
+            QMessageBox.information(
+                self, "Nothing to align",
+                f"Every track comes from {units[0][0].name}, so they are already in "
+                f"step with each other. To place it on another recording's clock, add "
+                f"that recording as a session reference.")
+            return
+        offsets: dict[Path, float] = {}
+        for track in self.tracks:
+            offsets.setdefault(track.path, track.offset)
+        self._align_result, self._align_error = None, ""
+        self.align_worker = AlignWorker(
+            units, offsets,
+            (reference.path, reference.stream_indices) if reference is not None else None)
+        w = self.align_worker
+        w.progress.connect(lambda _percent, message: self.statusBar().showMessage(message))
+        w.finished_ok.connect(self._on_align_result)
+        w.failed.connect(self._on_align_failed)
+        w.finished.connect(self._on_align_finished)
+        self.btn_align.setText("Cancel align")
+        self._update_busy()
+        w.start()
+
+    @Slot(object)
+    def _on_align_result(self, result: AlignmentResult) -> None:
+        self._align_result = result
+
+    @Slot(str)
+    def _on_align_failed(self, message: str) -> None:
+        self._align_error = message
+
+    @Slot()
+    def _on_align_finished(self) -> None:
+        worker = self.align_worker
+        if worker is None:
+            return
+        worker.wait()
+        self.align_worker = None
+        result, error = self._align_result, self._align_error
+        self._align_result, self._align_error = None, ""
+        if self._closing:
+            return
+        if worker.cancelled or error or result is None:
+            self._update_busy()
+            if error:
+                self.statusBar().showMessage("Align stopped. No offsets were changed.", 8000)
+                QMessageBox.warning(self, "Align", error)
+            else:
+                self.statusBar().showMessage(
+                    "Align cancelled. No offsets were changed.", 8000)
+            return
+        self._align_reviewing = True
+        self._update_busy()
+        self.statusBar().showMessage("Align finished: review the suggested offsets.")
+        self._review_alignment(result)
+
+    def _review_alignment(self, result: AlignmentResult) -> None:
+        """Open the review window once nothing else modal is open, then apply."""
+        if self._closing:
+            self._align_reviewing = False
+            return
+        if QApplication.activeModalWidget() is not None:
+            # Over another prompt (Export's file dialog, say) Apply would change
+            # offsets underneath it; wait for it to close.
+            QTimer.singleShot(250, self, lambda: self._review_alignment(result))
+            return
+        # An Offset typed but not yet committed is the user's: make it count
+        # before "Now" and the typed-value protection are read.
+        self._offset_delegate.finish_open_edit()
+        result = self._on_current_anchor(result)
+        try:
+            dialog = AlignReviewDialog(result, self.tracks, self)
+            accepted = bool(dialog.exec())
+            chosen = dialog.chosen()
+            dialog.deleteLater()
+        finally:
+            self._align_reviewing = False
+            if not self._closing:
+                self._update_busy()
+        if self._closing:
+            return
+        if not accepted:
+            self.statusBar().showMessage("No offsets were changed.", 8000)
+            return
+        self._apply_alignment(chosen)
+
+    def _on_current_anchor(self, result: AlignmentResult) -> AlignmentResult:
+        """Without a session reference, hang the suggestions from the reference
+        file's offset as it is now: it may have been typed while Align ran."""
+        rows = [t for t in self.tracks if t.path == result.reference]
+        if result.mode == SESSION_REFERENCE or not rows or rows[0].offset == result.anchor:
+            return result
+        moved = rebase(result, rows[0].offset)
+        moved.note = (f"{result.reference.name}'s offset changed while Align ran, so these "
+                      f"are measured from its new value, {format_offset(rows[0].offset)}. "
+                      + moved.note).strip()
+        return moved
+
+    def _apply_alignment(self, chosen: list) -> None:
+        """Write ticked suggestions to every row of their file; skip files since removed."""
+        applied = 0
+        anchor_rows: list[int] = []
+        for suggestion in chosen:
+            rows = [i for i, t in enumerate(self.tracks) if t.path == suggestion.path]
+            if not rows or not suggestion.applicable:
+                continue
+            if suggestion.method == "reference" and all(
+                    self.tracks[i].offset == suggestion.offset for i in rows):
+                anchor_rows = rows    # didn't move: the value stays, and so does a typed one
+                continue
+            source = OffsetSource.GUESS if suggestion.method == "guess" else OffsetSource.MATCHED
+            for i in rows:
+                self.tracks[i].offset = suggestion.offset
+                self.tracks[i].offset_source = source
+                self._show_offset(i)
+            applied += 1
+        if applied:
+            # The others now hang from the anchor's value: it is part of the
+            # alignment, so a later run counts it as placed (see the review).
+            for i in anchor_rows:
+                if self.tracks[i].offset_source is OffsetSource.DEFAULT:
+                    self.tracks[i].offset_source = OffsetSource.MATCHED
+                    self._show_offset(i)
+        self._schedule_refresh()
+        self.statusBar().showMessage(
+            f"Applied {applied} offset(s)." if applied else "No offsets were changed.", 8000)
 
     # ---------- Transcription ----------
 
@@ -873,10 +1353,10 @@ class MainWindow(QMainWindow):
         w.start()
 
     def _set_running(self, running: bool) -> None:
-        for widget in (self.btn_add, self.btn_remove, self.btn_clear,
-                       self.combo_model, self.combo_lang, self.combo_device,
+        for widget in (self.combo_model, self.combo_lang, self.combo_device,
                        self.edit_hints, self.btn_ai_notes):
             widget.setEnabled(not running)
+        self._update_busy()
         self.btn_export.setEnabled(not running and bool(merge_tracks(self.tracks)))
         self.btn_transcribe.setText("Cancel" if running else "Transcribe")
         self.btn_transcribe.setEnabled(True)
@@ -1046,6 +1526,8 @@ class MainWindow(QMainWindow):
                 if not self._confirm_overwrite(
                         [t for t in targets if t != path and t.exists()]):
                     return
+                # Merged again: Align's review can open over the prompts above.
+                segments = merge_tracks(self.tracks)
                 written = exporters.export_all(path, segments, self.tracks, model_name)
                 self.statusBar().showMessage("Exported: " + ", ".join(p.name for p in written))
             else:
@@ -1057,6 +1539,7 @@ class MainWindow(QMainWindow):
                     path = path.with_name(path.name + ext)
                     if path.exists() and not self._confirm_overwrite([path]):
                         return
+                segments = merge_tracks(self.tracks)
                 exporters.export(path, segments, self.tracks, model_name)
                 self.statusBar().showMessage(f"Exported {path}")
         except OSError as exc:
@@ -1283,12 +1766,15 @@ class MainWindow(QMainWindow):
                 self.worker.stop()
             if self.notes_worker is not None:
                 self.notes_worker.stop()
+            if self.align_worker is not None:
+                self.align_worker.stop()
             self.stats_poller.stop()
         # Never destroy a running QThread. Keep the event loop alive for its
         # queued signals; a model download/load may not be interruptible yet.
         # Kill any notes server that was started during cancellation too.
         llm.free_llm()
-        threads = (self.worker, self.notes_worker, self.stats_poller, self.device_probe)
+        threads = (self.worker, self.notes_worker, self.align_worker,
+                   self.stats_poller, self.device_probe)
         if any(thread is not None and thread.isRunning() for thread in threads):
             event.ignore()
             if not self._close_timer.isActive():

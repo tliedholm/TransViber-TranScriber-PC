@@ -64,6 +64,22 @@ class Track:
         return f"{self.path.name} [{', '.join(parts)}]" if parts else self.path.name
 
 
+@dataclass
+class SessionReference:
+    """A full-session recording used only as Align's clock.
+
+    Its start is session 0:00. It is deliberately not a Track: it is never
+    transcribed, exported, counted as a speaker or sent to AI Notes.
+    """
+    path: Path
+    duration: float = 0.0
+    streams: int = 1   # audio streams in the file; Align hears them summed
+
+    @property
+    def stream_indices(self) -> list[int | None]:
+        return list(range(self.streams)) if self.streams > 1 else [None]
+
+
 AUDIO_EXTENSIONS = {
     ".flac", ".m4a", ".mp4", ".aac", ".mp3", ".wav", ".ogg",
     ".opus", ".wma", ".webm", ".mka", ".mkv", ".mov", ".aif", ".aiff",

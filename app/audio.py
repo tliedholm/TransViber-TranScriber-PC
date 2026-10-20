@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterator
 
 if TYPE_CHECKING:
     import numpy as np
@@ -137,3 +137,44 @@ def decode_track_audio(path: Path, stream_index: int | None, channel: int | None
     if not chunks:
         return np.zeros(0, dtype=np.float32)
     return np.concatenate(chunks).astype(np.float32, copy=False)
+
+
+def iter_stream_power(path: Path, stream_index: int | None, rate: int) -> Iterator[np.ndarray]:
+    """Decode one stream at `rate` as chunks of power summed over its channels.
+
+    For callers that measure loudness once, in passing — track alignment,
+    which reads whole files: nothing is held beyond one decoded chunk, where
+    a four-hour track at 16 kHz is close to a gigabyte. Every channel counts
+    in full. A mono downmix would not do: it gives an LFE-labelled channel
+    (the 4th of a 5.1 layout, the 3rd of a 2.1) no weight at all, and in a
+    multitrack file that channel can be someone's microphone.
+    """
+    import av
+    import numpy as np
+    from av.audio.resampler import AudioResampler
+
+    def power(frames) -> Iterator[np.ndarray]:
+        for out in frames:
+            # Packed float: one row of interleaved samples.
+            samples = out.to_ndarray().reshape(-1, len(out.layout.channels))
+            if samples.size:
+                # Per sample, before channels are summed: a filter gone
+                # unstable in one channel (NaN to the end of the file) must
+                # not take the healthy channels beside it down too.
+                samples = np.nan_to_num(samples.astype(np.float64),
+                                        nan=0.0, posinf=0.0, neginf=0.0)
+                yield np.sum(samples * samples, axis=1)
+
+    with av.open(str(path)) as container:
+        index = stream_index if stream_index is not None else 0
+        streams = container.streams.audio
+        if index >= len(streams):
+            raise ValueError(f"{path.name} has no audio stream {index + 1} "
+                             f"({len(streams)} found) — has the file changed?")
+        resampler = None
+        for frame in container.decode(streams[index]):
+            if resampler is None:
+                resampler = AudioResampler(format="flt", layout=frame.layout, rate=rate)
+            yield from power(resampler.resample(frame))
+        if resampler is not None:
+            yield from power(resampler.resample(None))
