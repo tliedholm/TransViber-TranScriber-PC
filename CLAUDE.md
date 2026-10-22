@@ -116,7 +116,7 @@ Qt `Signal`s (never touch widgets off the main thread):
 GPU/VRAM/CPU/RAM status readout via NVML + psutil). `MainWindow` connects
 to their signals and updates widgets. A one-shot answer can instead stay on
 the worker for the `finished` handler to read after `wait()`: `AlignWorker`
-leaves `result`, `error` and `cancelled` there.
+leaves `result`, `error`, `cancelled` and `fingerprints` there.
 
 `DeviceProbe` checks CUDA through the driver API in a background thread
 after the window opens. Do not import CTranslate2/PyTorch to detect the GPU
@@ -179,6 +179,15 @@ is ever applied automatically; a typed value is the undo.
   file and a mix share that speaker's syllable onsets while other voices
   fill the mix, and loudness matched with its peak barely clear of its own
   neighbourhood.
+- **Reuse.** Decoding is most of Align's time (about 20 s per 4-hour
+  file), so the window keeps each fingerprint from the last run, keyed by
+  path and streams and stamped with the file's modified time and size. A
+  file unchanged since is not decoded again, so pressing Align a second
+  time costs only the matching. Only files loaded when Align is pressed
+  keep theirs, which bounds it at about 11.5 MB per 4-hour file. Within one
+  `find_offset`, `_Transforms` works out the reference's FFT once per size:
+  the whole file, each part and each stretch all slide along the same
+  reference, and that took the reference's FFTs from 12 to 2 per match.
 - **Trust.** The label comes from peak ÷ best score more than 0.5 s away:
   strong ≥ `MATCH_RATIO` (ticked), weak ≥ `WEAK_RATIO` (unticked), else no
   match. Lags are only scored where the files overlap by

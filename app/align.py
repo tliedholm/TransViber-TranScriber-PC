@@ -238,21 +238,53 @@ class Match:
     windows_spread: float = 0.0   # seconds between the agreeing parts' lags
 
 
-def _scores(ref, other, lag_range: tuple[int, int] | None = None):
+class _Transforms:
+    """`ref`'s FFTs and running sum of squares, worked out once per match.
+
+    A match slides the whole other file, then each of its parts and
+    stretches, along the same reference: a dozen correlations at only two or
+    three FFT sizes, so all but those few transforms of `ref` would be the
+    same work again.
+    """
+
+    def __init__(self, ref) -> None:
+        self.ref = ref
+        self._spectra: dict[int, object] = {}
+        self._squares = None
+
+    def spectrum(self, size: int):
+        import numpy as np
+
+        if size not in self._spectra:
+            self._spectra[size] = np.fft.rfft(self.ref, size)
+        return self._spectra[size]
+
+    def squares(self):
+        import numpy as np
+
+        if self._squares is None:
+            self._squares = np.concatenate([[0.0], np.cumsum(self.ref * self.ref)])
+        return self._squares
+
+
+def _scores(ref, other, lag_range: tuple[int, int] | None = None,
+            transforms: _Transforms | None = None):
     """(lags, score): normalised cross-correlation of `other` slid along `ref`.
 
     Scored at every lag where the two overlap by at least MIN_OVERLAP_SECONDS
     (or half the shorter recording, if that is less), and -inf elsewhere.
-    `lag_range` limits the lags to [lo, hi] frames.
+    `lag_range` limits the lags to [lo, hi] frames. `transforms`, made for
+    this same `ref`, saves working its FFT out again.
     """
     import numpy as np
 
+    transforms = transforms or _Transforms(ref)
     n, m = ref.size, other.size
     size = 1 << int(np.ceil(np.log2(n + m)))
-    corr = np.fft.irfft(np.fft.rfft(ref, size) * np.conj(np.fft.rfft(other, size)), size)
+    corr = np.fft.irfft(transforms.spectrum(size) * np.conj(np.fft.rfft(other, size)), size)
     lags = np.arange(-(m - 1), n)
     corr = np.concatenate([corr[size - (m - 1):], corr[:n]]) if m > 1 else corr[:n]
-    ref_sq = np.concatenate([[0.0], np.cumsum(ref * ref)])
+    ref_sq = transforms.squares()
     other_sq = np.concatenate([[0.0], np.cumsum(other * other)])
     r0, r1 = np.maximum(0, lags), np.minimum(n, lags + m)
     o0, o1 = np.maximum(0, -lags), np.minimum(m, n - lags)
@@ -297,11 +329,11 @@ def _peak(score) -> tuple[int, float, float]:
     return best, peak, _ratio(peak, _rival(score, best))
 
 
-def _best_lag(ref, other) -> tuple[int, float]:
+def _best_lag(ref, other, transforms: _Transforms | None = None) -> tuple[int, float]:
     """(lag in frames, peak/runner-up) of `other` slid along `ref`."""
     if ref.size == 0 or other.size == 0:
         return 0, 0.0
-    lags, score = _scores(ref, other)
+    lags, score = _scores(ref, other, transforms=transforms)
     best, _score, ratio = _peak(score)
     return int(lags[best]), ratio
 
@@ -314,8 +346,8 @@ def _strength(ratio: float) -> str:
     return "none"
 
 
-def _part_verdict(ref, other, part_start: int, part_end: int,
-                  lag: int) -> tuple[str, int]:
+def _part_verdict(ref, other, part_start: int, part_end: int, lag: int,
+                  transforms: _Transforms | None = None) -> tuple[str, int]:
     """("agrees" | "disagrees" | "unclear", lag found) for one part of `other`.
 
     The part searches on its own, as if the whole-file match had never been
@@ -332,7 +364,8 @@ def _part_verdict(ref, other, part_start: int, part_end: int,
 
     part = other[part_start:part_end]
     size = part.size
-    lags, score = _scores(ref, part, (-(size // 10), ref.size - size + size // 10))
+    lags, score = _scores(ref, part, (-(size // 10), ref.size - size + size // 10),
+                          transforms)
     best, peak, ratio = _peak(score)
     found = int(lags[best]) - part_start
     if peak <= 0:
@@ -369,7 +402,8 @@ def find_offset(ref, other, require_window_agreement: bool = False) -> Match:
     of `other`'s active audio must each find the same lag on their own, and
     none may find its own match somewhere else.
     """
-    lag, ratio = _best_lag(ref, other)
+    transforms = _Transforms(ref)
+    lag, ratio = _best_lag(ref, other, transforms)
     match = Match(lag=lag / FRAME_RATE, strength=_strength(ratio), ratio=ratio)
     if match.strength == "none":
         match.detail = "no usable shared sound"
@@ -397,14 +431,16 @@ def find_offset(ref, other, require_window_agreement: bool = False) -> Match:
         for part_start in (start, end - size):
             if _active_seconds(other, part_start, part_start + size).size < MIN_ACTIVE_SECONDS:
                 continue
-            verdict, found = _part_verdict(ref, other, part_start, part_start + size, lag)
+            verdict, found = _part_verdict(ref, other, part_start, part_start + size, lag,
+                                           transforms)
             if verdict == "disagrees":
                 return _weak(match, f"start and end disagree by "
                                     f"{abs(found - lag) / FRAME_RATE:.1f} s: clock drift, "
                                     f"a paused recorder or an edited file")
 
     if require_window_agreement:
-        agreeing, checked, spread, conflict = _window_agreement(ref, other, lag, start, end)
+        agreeing, checked, spread, conflict = _window_agreement(ref, other, lag, start, end,
+                                                                transforms)
         match.windows_agreeing, match.windows_checked = agreeing, checked
         match.windows_spread = spread
         if conflict is not None:
@@ -435,8 +471,9 @@ def _active_seconds(other, start: int, end: int):
     return np.flatnonzero(per_second > max(ACTIVE_SHARE * busiest, SOUND_ENERGY))
 
 
-def _window_agreement(ref, other, lag: int, start: int,
-                      end: int) -> tuple[int, int, float, float | None]:
+def _window_agreement(ref, other, lag: int, start: int, end: int,
+                      transforms: _Transforms | None = None
+                      ) -> tuple[int, int, float, float | None]:
     """(agreeing, checked, spread s, conflict s): `other` matched in separate stretches.
 
     The stretches are cut from `other`'s active audio within the overlap —
@@ -455,7 +492,7 @@ def _window_agreement(ref, other, lag: int, start: int,
         share = active[k * active.size // count:(k + 1) * active.size // count]
         part_start = start + int(share[0]) * FRAME_RATE
         part_end = start + (int(share[-1]) + 1) * FRAME_RATE
-        verdict, shift = _part_verdict(ref, other, part_start, part_end, lag)
+        verdict, shift = _part_verdict(ref, other, part_start, part_end, lag, transforms)
         if verdict == "agrees":
             found.append(shift)
         elif verdict == "disagrees" and conflict is None:
@@ -686,6 +723,16 @@ def decode_energy(path: Path, stream_index: int | None, should_stop):
     return envelope.energy()
 
 
+def _on_disk(path: Path) -> tuple[int, int] | None:
+    """(modified time, size) of `path`, for telling whether it has changed;
+    None when it can't be looked at."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return st.st_mtime_ns, st.st_size
+
+
 class AlignWorker(QThread):
     """Works out offset suggestions from the speaker files; applies nothing.
 
@@ -695,17 +742,25 @@ class AlignWorker(QThread):
     optional timing-only file. A run ends with `result` (an AlignmentResult)
     set, `error` (a message) set, or — when cancelled — neither, for the
     window to read once QThread.finished arrives.
+
+    `known` holds fingerprints from earlier runs, by (path, tuple of
+    streams), each with the file's modified time and size when it was read:
+    a file unchanged since then isn't decoded again. Every fingerprint this
+    run had, read or reused, is left in `fingerprints` in the same form, a
+    cancelled run's included.
     """
 
     progress = Signal(int, str)       # percent, message
 
     def __init__(self, units: list[tuple[Path, list[int | None]]], current_offsets: dict,
                  session_reference: tuple[Path, list[int | None]] | None = None,
-                 parent=None) -> None:
+                 known: dict | None = None, parent=None) -> None:
         super().__init__(parent)
         self.units = list(units)
         self.current_offsets = dict(current_offsets)
         self.session_reference = session_reference
+        self.known = dict(known or {})
+        self.fingerprints: dict = {}
         self.result: AlignmentResult | None = None
         self.error = ""
         self.cancelled = False
@@ -718,10 +773,18 @@ class AlignWorker(QThread):
         return self._stop
 
     def _read(self, path: Path, streams: list[int | None]):
-        energy = sum_energies([decode_energy(path, s, self._should_stop) for s in streams])
-        if energy.size == 0 or float(energy.max()) < SILENCE_ENERGY:
-            raise ValueError("there is no usable audio in it")
-        return fingerprint(energy)
+        key, on_disk = (path, tuple(streams)), _on_disk(path)
+        kept = self.known.get(key)
+        if on_disk is not None and kept is not None and kept[0] == on_disk:
+            fp = kept[1]
+        else:
+            energy = sum_energies([decode_energy(path, s, self._should_stop) for s in streams])
+            if energy.size == 0 or float(energy.max()) < SILENCE_ENERGY:
+                raise ValueError("there is no usable audio in it")
+            fp = fingerprint(energy)
+        if on_disk is not None:
+            self.fingerprints[key] = (on_disk, fp)
+        return fp
 
     def run(self) -> None:
         try:

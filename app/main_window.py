@@ -431,6 +431,9 @@ class MainWindow(QMainWindow):
         self.session_reference: SessionReference | None = None
         self.align_worker: AlignWorker | None = None
         self._align_reviewing = False
+        # Fingerprints from the last Align, by (path, streams), for the files
+        # it read: one unchanged since isn't decoded again (see AlignWorker).
+        self._align_fingerprints: dict = {}
         self.has_cuda: bool | None = None
         self._closing = False
         self._notes_load_failed = False
@@ -1163,9 +1166,15 @@ class MainWindow(QMainWindow):
         offsets: dict[Path, float] = {}
         for track in self.tracks:
             offsets.setdefault(track.path, track.offset)
-        self.align_worker = AlignWorker(
-            units, offsets,
-            (reference.path, reference.stream_indices) if reference is not None else None)
+        reference_unit = ((reference.path, reference.stream_indices)
+                          if reference is not None else None)
+        # Only what this run can use is kept: a file since removed lets go of its own.
+        jobs = units + ([reference_unit] if reference_unit is not None else [])
+        wanted = {(path, tuple(streams)) for path, streams in jobs}
+        self._align_fingerprints = {key: kept for key, kept in self._align_fingerprints.items()
+                                    if key in wanted}
+        self.align_worker = AlignWorker(units, offsets, reference_unit,
+                                        known=self._align_fingerprints)
         w = self.align_worker
         w.progress.connect(lambda _percent, message: self.statusBar().showMessage(message))
         w.finished.connect(self._on_align_finished)
@@ -1180,6 +1189,7 @@ class MainWindow(QMainWindow):
             return
         worker.wait()
         self.align_worker = None
+        self._align_fingerprints.update(worker.fingerprints)
         if self._closing:
             return
         result = worker.result
