@@ -337,6 +337,12 @@ is ever applied automatically; a typed value is the undo.
   cuts audio into VAD speech regions, detects language once from the
   clearest sample and locks it for the whole track, then drops segments
   written in a script the locked language can't use (`_foreign_script`).
+  Its languages are a closed list: `QWEN_LANGUAGE_NAMES` holds only names
+  qwen-asr accepts (0.0.6 has no Norwegian or Ukrainian), and
+  `language_supported` is checked twice. The window greys out what the
+  chosen model lacks and refuses a selection it already had, never turning
+  it into auto-detect; `TranscribeWorker.run` refuses it before any model
+  loads, so the error can't reach the GPU-to-CPU retry.
 
 Adding a model usually means adding an alias to `WHISPER_ALIASES` /
 `ONNX_ALIASES` / `QWEN_REPOS`, and (for the UI) to `MODEL_GROUPS` in
@@ -459,6 +465,12 @@ come from pip wheels. `cuda_setup.py` adds their directories to the DLL
 search path **and must be imported before ctranslate2/faster_whisper load**
 (`transcriber.py` imports it first, `# noqa: F401`). In the frozen build the
 DLLs come from torch's bundled `torch/lib` set instead of the nvidia wheels.
+Whatever loads them has to be a CUDA 12 build: torch is `+cu128` from
+PyTorch's index, and onnxruntime-gpu comes from Microsoft's CUDA 12 feed,
+because PyPI's is built for CUDA 13 from 1.27 on. `pip freeze` records
+neither source, so the install order and the onnxruntime wheel's hash live
+in the header of `requirements.lock.txt`; change it and the README's setup
+steps together.
 
 `runtime.py` centralizes every path that differs between source and the
 PyInstaller build (`IS_FROZEN`): `bundle_dir()` (read-only bundled data),
@@ -505,6 +517,8 @@ What is pinned, and why it is worth keeping pinned:
   depends on, which is otherwise only a comment reaching across two modules.
   `test_transcriber.Decoding` pins what the worker hands a model (Whisper
   gets the decoded array) and that a file problem never moves to the CPU.
+  `test_transcriber` also checks Qwen's language list against the installed
+  qwen-asr's, read from its source rather than imported (that loads torch).
 - `test_audio` — decoding on the file's clock, on files it writes with PyAV:
   a gap, a stream that began late, a clock that starts at 10 s, one channel
   against the whole stream, frame sizes and rates, an ordinary WAV sample
@@ -513,7 +527,11 @@ What is pinned, and why it is worth keeping pinned:
   packets and missing timestamps through a stand-in container.
 - `test_exporters` — timestamp formats, VTT escaping, and `target_paths`
   (the "Session 2.5" case, where `with_suffix` would write a file the user
-  never named).
+  never named). Also that every export replaces each file whole or not at
+  all: all of them are staged beside their targets before any is renamed
+  over one, and a rename that fails raises an `ExportError` (an `OSError`)
+  naming the files already new and the ones still old. Five renames are
+  not one transaction; don't let a docstring claim they are.
 - `test_merger.Offsets` / `test_align` — the offset applied once, to copies,
   with all-zero offsets giving exactly the old order; and every input form
   the Offset column accepts or rejects, with its reason. `test_align` also
@@ -540,7 +558,10 @@ What is pinned, and why it is worth keeping pinned:
   window (offscreen), plus the Offset column driven through its real cell
   editor. Typed edits commit through `_OffsetDelegate`, not `itemChanged`:
   Qt drops a write of unchanged text, and retyping the shown `0:00` is a
-  deliberate "starts at zero" that must still count as typed. `Alignment`
+  deliberate "starts at zero" that must still count as typed. The export
+  warning is driven through `export_dialog`: a track that failed, was
+  cancelled or never ran counts whether or not it produced a segment, and
+  a finished track with none (silent audio) does not. `Alignment`
   runs the real `AlignWorker` thread with `run()` scripted and plays the
   review window by replacing only its `exec()`. Each test deletes its
   window in cleanup rather than leaving it to the garbage collector:

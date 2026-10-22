@@ -34,9 +34,10 @@ ONNX_ALIASES = {
 }
 
 
-# Qwen3-ASR (Apache-2.0, 52 languages) runs through the official qwen-asr
-# package on CUDA; word timestamps come from its companion forced-aligner
-# model. Ported from the Mac edition's MLX integration.
+# Qwen3-ASR (Apache-2.0, 30 languages plus 22 Chinese dialects) runs through
+# the official qwen-asr package on CUDA; word timestamps come from its
+# companion forced-aligner model. Ported from the Mac edition's MLX
+# integration.
 QWEN_REPOS = {
     "qwen3-asr-1.7b": "Qwen/Qwen3-ASR-1.7B",
     "qwen3-asr-0.6b": "Qwen/Qwen3-ASR-0.6B",
@@ -47,13 +48,17 @@ QWEN_REPOS = {
 QWEN_ALIGNER_REPO = "Qwen/Qwen3-ForcedAligner-0.6B"
 QWEN_LANGUAGE_PROBE_SECONDS = 30
 
-# Qwen expects full language names, not ISO codes.
+# Qwen expects full language names, not ISO codes. This is also the list of
+# Language choices Qwen can take, so it holds only names qwen-asr accepts:
+# anything outside its SUPPORTED_LANGUAGES raises ValueError (0.0.6 has no
+# Norwegian or Ukrainian, which Whisper has), and only once the model has
+# loaded. See language_supported.
 QWEN_LANGUAGE_NAMES = {
     "en": "English", "sv": "Swedish", "es": "Spanish", "fr": "French",
     "de": "German", "it": "Italian", "pt": "Portuguese", "nl": "Dutch",
-    "da": "Danish", "no": "Norwegian", "fi": "Finnish", "pl": "Polish",
-    "ru": "Russian", "uk": "Ukrainian", "ja": "Japanese", "ko": "Korean",
-    "zh": "Chinese", "ar": "Arabic", "hi": "Hindi", "tr": "Turkish",
+    "da": "Danish", "fi": "Finnish", "pl": "Polish", "ru": "Russian",
+    "ja": "Japanese", "ko": "Korean", "zh": "Chinese", "ar": "Arabic",
+    "hi": "Hindi", "tr": "Turkish",
 }
 
 # Scripts each Qwen language can be written in (unlisted languages use Latin).
@@ -124,6 +129,15 @@ def engine_for(model_name: str) -> str:
     ):
         return "onnx"
     return "whisper"
+
+
+def language_supported(model_name: str, language: str | None) -> bool:
+    """Whether `model_name` can be told to transcribe `language`, a Language
+    dropdown code (None is auto-detect). Only Qwen has a closed list: Whisper
+    knows every language the dropdown offers, and the NVIDIA models ignore
+    the setting."""
+    return (language is None or engine_for(model_name) != "qwen"
+            or language in QWEN_LANGUAGE_NAMES)
 
 
 def _qwen_char_spans(text: str, words) -> list[tuple[int, int]] | None:
@@ -463,7 +477,9 @@ class TranscribeWorker(QThread):
             self.track_done.emit(i, "")
             return False
 
-        language = QWEN_LANGUAGE_NAMES.get(self.language) if self.language else None
+        # run() has already refused a language Qwen can't take, so a missing
+        # entry here is a bug, not a cue to auto-detect.
+        language = QWEN_LANGUAGE_NAMES[self.language] if self.language else None
         detected = language or ""
 
         # Auto-detecting every short VAD region independently is unreliable:
@@ -605,6 +621,16 @@ class TranscribeWorker(QThread):
     def run(self) -> None:
         if self._stop:
             self.finished_all.emit(True)
+            return
+        # Before any model loads, and outside the GPU-to-CPU retry below: no
+        # device can transcribe a language the model doesn't have.
+        if not language_supported(self.model_name, self.language):
+            for i in self.indices:
+                self.track_failed.emit(
+                    i, f"{self.model_name} can't transcribe language "
+                       f"'{self.language}'. Choose another language or "
+                       f"Auto-detect, or a Whisper model.")
+            self.finished_all.emit(False)
             return
         try:
             model = self._load_model()

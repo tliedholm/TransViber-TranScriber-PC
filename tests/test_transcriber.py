@@ -3,6 +3,8 @@ and what the worker hands a model."""
 
 from __future__ import annotations
 
+import ast
+import importlib.util
 import tempfile
 import unittest
 from dataclasses import dataclass
@@ -17,7 +19,13 @@ import tests  # noqa: F401  (puts app/ on sys.path)
 import transcriber
 from models import Track
 from tests.test_audio import noise, write_mkv
-from transcriber import SPLIT_GAP_SECONDS, TranscribeWorker, engine_for, split_on_word_gaps
+from transcriber import (
+    SPLIT_GAP_SECONDS,
+    TranscribeWorker,
+    engine_for,
+    language_supported,
+    split_on_word_gaps,
+)
 
 
 @dataclass
@@ -93,6 +101,41 @@ class EngineRouting(unittest.TestCase):
 
     def test_routing_ignores_case(self):
         self.assertEqual(engine_for("PARAKEET-TDT-0.6B-V2"), "onnx")
+
+
+class LanguageSupport(unittest.TestCase):
+    """Qwen's Language choices are a closed list; the others take any."""
+
+    def test_qwen_refuses_what_qwen_asr_does_not_support(self):
+        for model in ("qwen3-asr-1.7b", "qwen3-asr-0.6b", "Qwen/Qwen3-ASR-0.6B"):
+            for language in ("no", "uk"):
+                with self.subTest(model=model, language=language):
+                    self.assertFalse(language_supported(model, language))
+
+    def test_qwen_takes_auto_detect_and_its_own_languages(self):
+        for language in (None, "en", "sv", "zh"):
+            with self.subTest(language=language):
+                self.assertTrue(language_supported("qwen3-asr-1.7b", language))
+
+    def test_whisper_and_nvidia_models_take_every_choice(self):
+        for model in ("large-v3", "parakeet-tdt-0.6b-v3"):
+            for language in ("no", "uk", "en", None):
+                with self.subTest(model=model, language=language):
+                    self.assertTrue(language_supported(model, language))
+
+    def test_every_qwen_language_is_one_the_installed_qwen_asr_accepts(self):
+        # Read the list out of the package's source, not by importing it:
+        # importing qwen_asr loads torch and transformers.
+        spec = importlib.util.find_spec("qwen_asr")
+        if spec is None:
+            self.skipTest("qwen-asr is not installed")
+        source = Path(spec.origin).with_name("inference") / "utils.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        supported = next(
+            ast.literal_eval(node.value) for node in ast.walk(tree)
+            if isinstance(node, ast.AnnAssign)
+            and getattr(node.target, "id", None) == "SUPPORTED_LANGUAGES")
+        self.assertEqual(set(transcriber.QWEN_LANGUAGE_NAMES.values()) - set(supported), set())
 
 
 class ForeignScript(unittest.TestCase):
