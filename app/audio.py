@@ -83,6 +83,20 @@ def tracks_for_file(path: Path, split_stereo: bool = False) -> list[Track]:
     return tracks
 
 
+def _audio_stream(container, path: Path, stream_index: int | None):
+    """The audio stream a track names in an open container."""
+    # Not `stream_index or 0`: that reads index 0 and "no index given" as
+    # the same thing. They mean the same today, but the file can also have
+    # changed since it was probed, which would raise a bare IndexError
+    # into the worker's generic handler.
+    index = stream_index if stream_index is not None else 0
+    streams = container.streams.audio
+    if index >= len(streams):
+        raise ValueError(f"{path.name} has no audio stream {index + 1} "
+                         f"({len(streams)} found) — has the file changed?")
+    return streams[index]
+
+
 def decode_track_audio(path: Path, stream_index: int | None, channel: int | None) -> np.ndarray:
     """Decode one stream (and optionally one channel of it) to mono float32 16 kHz."""
     import av
@@ -100,17 +114,7 @@ def decode_track_audio(path: Path, stream_index: int | None, channel: int | None
                 chunks.append(arr)
 
     with av.open(str(path)) as container:
-        # Not `stream_index or 0`: that reads index 0 and "no index given" as
-        # the same thing. They mean the same today, but the file can also have
-        # changed since it was probed, which would raise a bare IndexError
-        # into the worker's generic handler.
-        index = stream_index if stream_index is not None else 0
-        streams = container.streams.audio
-        if index >= len(streams):
-            raise ValueError(f"{path.name} has no audio stream {index + 1} "
-                             f"({len(streams)} found) — has the file changed?")
-        stream = streams[index]
-        for frame in container.decode(stream):
+        for frame in container.decode(_audio_stream(container, path, stream_index)):
             if channel is None:
                 collect(to_mono.resample(frame))
                 continue
@@ -166,15 +170,14 @@ def iter_stream_power(path: Path, stream_index: int | None, rate: int) -> Iterat
                 yield np.sum(samples * samples, axis=1)
 
     with av.open(str(path)) as container:
-        index = stream_index if stream_index is not None else 0
-        streams = container.streams.audio
-        if index >= len(streams):
-            raise ValueError(f"{path.name} has no audio stream {index + 1} "
-                             f"({len(streams)} found) — has the file changed?")
         resampler = None
-        for frame in container.decode(streams[index]):
+        for frame in container.decode(_audio_stream(container, path, stream_index)):
             if resampler is None:
-                resampler = AudioResampler(format="flt", layout=frame.layout, rate=rate)
+                # One-second chunks: left to itself the resampler hands back
+                # a few hundred samples at a time, and the per-chunk NumPy
+                # calls then cost twice what decoding does.
+                resampler = AudioResampler(format="flt", layout=frame.layout, rate=rate,
+                                           frame_size=rate)
             yield from power(resampler.resample(frame))
         if resampler is not None:
             yield from power(resampler.resample(None))

@@ -25,7 +25,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
-    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -129,13 +128,6 @@ EXPORT_FILTERS = (
     "Markdown (*.md);;Plain text (*.txt);;SubRip subtitles (*.srt);;"
     "WebVTT subtitles (*.vtt);;JSON (*.json);;All formats (*.md *.txt *.srt *.vtt *.json)"
 )
-
-
-def _fmt_duration(seconds: float) -> str:
-    s = int(seconds)
-    h, rem = divmod(s, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
 def _canonical(path: Path) -> str:
@@ -288,11 +280,8 @@ class _OffsetDelegate(QStyledItemDelegate):
             self.closeEditor.emit(editor, QAbstractItemDelegate.EndEditHint.NoHint)
 
     def setModelData(self, editor, model, index) -> None:
-        if isinstance(editor, QLineEdit):
-            if editor.isModified():
-                self._on_commit(index.row(), editor.text())
-            return
-        super().setModelData(editor, model, index)
+        if editor.isModified():
+            self._on_commit(index.row(), editor.text())
 
 
 class AlignReviewDialog(QDialog):
@@ -303,8 +292,9 @@ class AlignReviewDialog(QDialog):
     unreadable file, a start before the session reference) has no checkbox.
     If the clock moves (every suggestion shifted later, or a file placed
     before would move) and a file that already has an offset would start
-    unticked, nothing starts ticked. "Now" is read when the window opens, so an offset typed while Align ran
-    shows as current, and, being typed, protects its row.
+    unticked, nothing starts ticked. "Now" is read when the window opens, so
+    an offset typed while Align ran shows as current, and, being typed,
+    protects its row.
     """
 
     COL_APPLY, COL_FILE, COL_NOW, COL_SUGGESTED, COL_HOW = range(5)
@@ -336,9 +326,9 @@ class AlignReviewDialog(QDialog):
         clock_moved = bool(result.shift) or any(
             placed(s) and any(abs(t.offset - s.offset) > CONSISTENCY_SECONDS
                               for t in rows_of[s.path]) for s in ticked)
-        self._default_ticks = not (clock_moved and left_behind)
+        default_ticks = not (clock_moved and left_behind)
         note = result.note
-        if not self._default_ticks:
+        if not default_ticks:
             names = ", ".join(left_behind)
             note += (f" Nothing is ticked yet: {names} already "
                      f"{'have offsets' if len(left_behind) > 1 else 'has an offset'}, and "
@@ -362,7 +352,8 @@ class AlignReviewDialog(QDialog):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(self.COL_HOW, QHeaderView.ResizeMode.Stretch)
         for row, suggestion in enumerate(self.suggestions):
-            self._fill_row(row, suggestion, rows_of[suggestion.path])
+            self._fill_row(row, suggestion, rows_of[suggestion.path],
+                           default_ticks and suggestion in ticked)
         layout.addWidget(self.table)
 
         hint = QLabel("Ticked rows go into the Offset column, where you can still change "
@@ -380,28 +371,22 @@ class AlignReviewDialog(QDialog):
     @staticmethod
     def _starts_ticked(suggestion, rows: list[Track]) -> bool:
         """Strong matches and the reference, unless you typed the file's offset."""
-        return (suggestion.applicable and bool(rows)
+        return (suggestion.applicable
                 and not any(t.offset_source is OffsetSource.MANUAL for t in rows)
                 and (suggestion.method == "reference" or suggestion.strength == "strong"))
 
-    def _fill_row(self, row: int, suggestion, rows: list[Track]) -> None:
-        manual = any(t.offset_source is OffsetSource.MANUAL for t in rows)
-        offsets = {t.offset for t in rows}
-        if not rows:
-            now = "removed"
-        elif len(offsets) == 1:
-            now = format_offset(rows[0].offset)
-        else:
-            now = "varies"
+    def _fill_row(self, row: int, suggestion, rows: list[Track], ticked: bool) -> None:
+        # The track list is locked from Align until this window closes, so
+        # every suggestion still has its rows.
+        now = format_offset(rows[0].offset) if len({t.offset for t in rows}) == 1 else "varies"
         reason = suggestion.reason
-        if manual:
+        if any(t.offset_source is OffsetSource.MANUAL for t in rows):
             reason += ". You set the current value"
 
         apply_item = QTableWidgetItem()
         apply_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
-        if suggestion.applicable and rows:
+        if suggestion.applicable:
             apply_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
-            ticked = self._default_ticks and self._starts_ticked(suggestion, rows)
             apply_item.setCheckState(Qt.CheckState.Checked if ticked else Qt.CheckState.Unchecked)
         self.table.setItem(row, self.COL_APPLY, apply_item)
         suggested = format_offset(suggestion.offset) if suggestion.offset is not None else "—"
@@ -446,8 +431,6 @@ class MainWindow(QMainWindow):
         self.session_reference: SessionReference | None = None
         self.align_worker: AlignWorker | None = None
         self._align_reviewing = False
-        self._align_result: AlignmentResult | None = None
-        self._align_error = ""
         self.has_cuda: bool | None = None
         self._closing = False
         self._notes_load_failed = False
@@ -818,15 +801,9 @@ class MainWindow(QMainWindow):
             self.combo_device.setEnabled(self.worker is None)
             self.btn_transcribe.setEnabled(self.notes_worker is None)
 
-    @staticmethod
-    def _format_elapsed(seconds: float) -> str:
-        m, s = divmod(int(seconds), 60)
-        h, m = divmod(m, 60)
-        return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-
     def _tick_elapsed(self) -> None:
         if self._run_started is not None:
-            self.elapsed_label.setText(self._format_elapsed(time.monotonic() - self._run_started))
+            self.elapsed_label.setText(exporters.hms(time.monotonic() - self._run_started))
 
     def _set_dark_mode(self, dark: bool) -> None:
         QGuiApplication.styleHints().setColorScheme(
@@ -902,7 +879,7 @@ class MainWindow(QMainWindow):
     def add_files(self, paths: list[Path]) -> None:
         if self._tracks_locked():
             return
-        existing = {_canonical(t.path) for t in self.tracks}
+        existing = self._speaker_file_keys()
         reference = self.session_reference
         reference_key = _canonical(reference.path) if reference is not None else None
         refused = None
@@ -926,6 +903,11 @@ class MainWindow(QMainWindow):
                 f"To transcribe it, click Remove reference above the track list, "
                 f"then add it again.")
 
+    def _speaker_file_keys(self) -> set[str]:
+        """Every speaker file, `_canonical`, resolved once per file rather
+        than once per row: resolving can be slow on a network share."""
+        return {_canonical(path) for path in {t.path for t in self.tracks}}
+
     def _append_row(self, track: Track, row: int | None = None) -> None:
         if row is None:
             row = self.table.rowCount()
@@ -940,7 +922,7 @@ class MainWindow(QMainWindow):
 
         for col, text in [
             (COL_FILE, track.source_label),
-            (COL_DURATION, _fmt_duration(track.duration)),
+            (COL_DURATION, exporters.hms(track.duration)),
             (COL_STATUS, track.status.value),
         ]:
             item = QTableWidgetItem(text)
@@ -959,34 +941,29 @@ class MainWindow(QMainWindow):
         """Write a track's offset into its cell, in standard form."""
         track = self.tracks[row]
         item = self.table.item(row, COL_OFFSET)
-        was_blocked = self.table.blockSignals(True)
-        try:
-            item.setText(format_offset(track.offset))
-            item.setToolTip(OFFSET_SOURCE_TIPS[track.offset_source])
-        finally:
-            self.table.blockSignals(was_blocked)
+        item.setText(format_offset(track.offset))
+        item.setToolTip(OFFSET_SOURCE_TIPS[track.offset_source])
+
+    def _set_offset(self, row: int, offset: float, source: OffsetSource) -> None:
+        track = self.tracks[row]
+        track.offset, track.offset_source = offset, source
+        self._show_offset(row)
 
     def _on_offset_edited(self, row: int, text: str) -> None:
-        """Apply a committed Offset edit, or put the old value back."""
+        """Apply an Offset edit committed through _OffsetDelegate, the only way
+        one arrives, or put the old value back."""
         if not 0 <= row < len(self.tracks):
             return
-        track = self.tracks[row]
         try:
             offset = parse_offset(text)
         except ValueError as exc:
             self.statusBar().showMessage(f"Offset not changed: {exc}", 8000)
-        else:
-            track.offset = offset
-            track.offset_source = OffsetSource.MANUAL
-            self._schedule_refresh()
-        self._show_offset(row)
+            self._show_offset(row)
+            return
+        self._set_offset(row, offset, OffsetSource.MANUAL)
+        self._schedule_refresh()
 
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
-        if item.column() == COL_OFFSET:
-            # Edits typed in the cell arrive through _OffsetDelegate; this
-            # catches any other write to the item.
-            self._on_offset_edited(item.row(), item.text())
-            return
         if item.column() != COL_SPEAKER:
             return
         row = item.row()
@@ -1010,6 +987,8 @@ class MainWindow(QMainWindow):
             self._split_track_channels(row)
 
     def _split_track_channels(self, row: int) -> None:
+        if self._tracks_locked():
+            return
         track = self.tracks[row]
         try:
             streams = probe_streams(track.path)
@@ -1074,7 +1053,7 @@ class MainWindow(QMainWindow):
         if self._aligning():
             return False
         key = _canonical(path)
-        if any(_canonical(t.path) == key for t in self.tracks):
+        if key in self._speaker_file_keys():
             QMessageBox.information(
                 self, "Already a speaker file",
                 f"{path.name} is in the track list as a speaker file, so it can't "
@@ -1116,7 +1095,7 @@ class MainWindow(QMainWindow):
         else:
             self.reference_label.setText(
                 f"<b>{html.escape(reference.path.name)}</b> "
-                f"({_fmt_duration(reference.duration)}) — Timing reference only; "
+                f"({exporters.hms(reference.duration)}) — Timing reference only; "
                 f"individual files are transcribed")
         self.btn_reference.setText("Replace…" if reference else "Add session reference…")
         self.btn_remove_reference.setVisible(reference is not None)
@@ -1184,26 +1163,15 @@ class MainWindow(QMainWindow):
         offsets: dict[Path, float] = {}
         for track in self.tracks:
             offsets.setdefault(track.path, track.offset)
-        self._align_result, self._align_error = None, ""
         self.align_worker = AlignWorker(
             units, offsets,
             (reference.path, reference.stream_indices) if reference is not None else None)
         w = self.align_worker
         w.progress.connect(lambda _percent, message: self.statusBar().showMessage(message))
-        w.finished_ok.connect(self._on_align_result)
-        w.failed.connect(self._on_align_failed)
         w.finished.connect(self._on_align_finished)
         self.btn_align.setText("Cancel align")
         self._update_busy()
         w.start()
-
-    @Slot(object)
-    def _on_align_result(self, result: AlignmentResult) -> None:
-        self._align_result = result
-
-    @Slot(str)
-    def _on_align_failed(self, message: str) -> None:
-        self._align_error = message
 
     @Slot()
     def _on_align_finished(self) -> None:
@@ -1212,15 +1180,14 @@ class MainWindow(QMainWindow):
             return
         worker.wait()
         self.align_worker = None
-        result, error = self._align_result, self._align_error
-        self._align_result, self._align_error = None, ""
         if self._closing:
             return
-        if worker.cancelled or error or result is None:
+        result = worker.result
+        if result is None:      # failed or cancelled
             self._update_busy()
-            if error:
+            if worker.error:
                 self.statusBar().showMessage("Align stopped. No offsets were changed.", 8000)
-                QMessageBox.warning(self, "Align", error)
+                QMessageBox.warning(self, "Align", worker.error)
             else:
                 self.statusBar().showMessage(
                     "Align cancelled. No offsets were changed.", 8000)
@@ -1273,30 +1240,25 @@ class MainWindow(QMainWindow):
         return moved
 
     def _apply_alignment(self, chosen: list) -> None:
-        """Write ticked suggestions to every row of their file; skip files since removed."""
+        """Write ticked suggestions to every row of their file."""
         applied = 0
         anchor_rows: list[int] = []
         for suggestion in chosen:
             rows = [i for i, t in enumerate(self.tracks) if t.path == suggestion.path]
-            if not rows or not suggestion.applicable:
-                continue
             if suggestion.method == "reference" and all(
                     self.tracks[i].offset == suggestion.offset for i in rows):
                 anchor_rows = rows    # didn't move: the value stays, and so does a typed one
                 continue
             source = OffsetSource.GUESS if suggestion.method == "guess" else OffsetSource.MATCHED
             for i in rows:
-                self.tracks[i].offset = suggestion.offset
-                self.tracks[i].offset_source = source
-                self._show_offset(i)
+                self._set_offset(i, suggestion.offset, source)
             applied += 1
         if applied:
             # The others now hang from the anchor's value: it is part of the
             # alignment, so a later run counts it as placed (see the review).
             for i in anchor_rows:
                 if self.tracks[i].offset_source is OffsetSource.DEFAULT:
-                    self.tracks[i].offset_source = OffsetSource.MATCHED
-                    self._show_offset(i)
+                    self._set_offset(i, self.tracks[i].offset, OffsetSource.MATCHED)
         self._schedule_refresh()
         self.statusBar().showMessage(
             f"Applied {applied} offset(s)." if applied else "No offsets were changed.", 8000)
@@ -1416,7 +1378,7 @@ class MainWindow(QMainWindow):
         self._elapsed_timer.stop()
         took = ""
         if self._run_started is not None:
-            elapsed = self._format_elapsed(time.monotonic() - self._run_started)
+            elapsed = exporters.hms(time.monotonic() - self._run_started)
             self.elapsed_label.setText(f"took {elapsed}")
             self._run_started = None
             took = f" in {elapsed}"
@@ -1444,7 +1406,7 @@ class MainWindow(QMainWindow):
         segments = merge_tracks(self.tracks)
         self._transcript_blocks = [
             f"<p><b>{html.escape(seg.speaker)}</b> "
-            f"<span style='color:gray'>[{_fmt_duration(seg.start)}]</span>: "
+            f"<span style='color:gray'>[{exporters.hms(seg.start)}]</span>: "
             f"{html.escape(seg.text.strip())}</p>"
             for seg in coalesce(segments)
         ]
@@ -1605,7 +1567,7 @@ class MainWindow(QMainWindow):
         tokens = self._notes_tokens_generated
         rate = f" · {tokens / seconds:.1f} tok/s" if seconds > 0 and tokens else ""
         self.notes_elapsed_label.setText(
-            f"{self._format_elapsed(seconds)} · {tokens:,} tok{rate}")
+            f"{exporters.hms(seconds)} · {tokens:,} tok{rate}")
 
     def _append_notes_text(self, text: str) -> None:
         cursor = self.notes_edit.textCursor()
@@ -1626,7 +1588,7 @@ class MainWindow(QMainWindow):
         stats = ""
         if self._notes_run_started is not None:
             seconds = time.monotonic() - self._notes_run_started
-            elapsed = self._format_elapsed(seconds)
+            elapsed = exporters.hms(seconds)
             tokens = self._notes_tokens_generated
             rate = f" · {tokens / seconds:.1f} tok/s avg" if seconds > 0 and tokens else ""
             stats = f" in {elapsed} · {tokens:,} tok{rate}"

@@ -32,6 +32,8 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
+from exporters import hms
+
 _LAST_FIELD = re.compile(r"\d+(\.\d+)?", re.ASCII)
 _WHOLE_FIELD = re.compile(r"\d+", re.ASCII)
 
@@ -124,17 +126,14 @@ def parse_offset(text: str) -> float:
 def format_offset(seconds: float) -> str:
     """`150.5` -> `2:30.5`, `3750` -> `1:02:30`, `0` -> `0:00`.
 
-    The same shape as the Duration column, plus up to three decimals with
+    The Duration column's shape (`hms`), plus up to three decimals with
     trailing zeros dropped, so a matched offset keeps its milliseconds.
     Negative values (a rejected suggestion, never an applied offset) get a
     leading minus.
     """
     sign = "-" if seconds < 0 else ""
-    ms_total = round(abs(seconds) * 1000)
-    whole, ms = divmod(ms_total, 1000)
-    h, rem = divmod(whole, 3600)
-    m, s = divmod(rem, 60)
-    text = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+    whole, ms = divmod(round(abs(seconds) * 1000), 1000)
+    text = hms(whole)
     if ms:
         text += "." + f"{ms:03d}".rstrip("0")
     return sign + text
@@ -286,18 +285,25 @@ def _rival(score, *centres: int) -> float:
     return float(np.max(rivals))
 
 
-def _best_lag(ref, other, lag_range: tuple[int, int] | None = None):
-    """(lag in frames, peak score, peak/runner-up) of `other` slid along `ref`."""
+def _peak(score) -> tuple[int, float, float]:
+    """(index, score, peak/runner-up) of the best lag; score and ratio are 0
+    when no lag scored above zero."""
     import numpy as np
 
-    if ref.size == 0 or other.size == 0:
-        return 0, 0.0, 0.0
-    lags, score = _scores(ref, other, lag_range)
     best = int(np.argmax(score))
     peak = float(score[best])
     if not np.isfinite(peak) or peak <= 0:
-        return int(lags[best]), 0.0, 0.0
-    return int(lags[best]), peak, _ratio(peak, _rival(score, best))
+        return best, 0.0, 0.0
+    return best, peak, _ratio(peak, _rival(score, best))
+
+
+def _best_lag(ref, other) -> tuple[int, float]:
+    """(lag in frames, peak/runner-up) of `other` slid along `ref`."""
+    if ref.size == 0 or other.size == 0:
+        return 0, 0.0
+    lags, score = _scores(ref, other)
+    best, _score, ratio = _peak(score)
+    return int(lags[best]), ratio
 
 
 def _strength(ratio: float) -> str:
@@ -327,12 +333,11 @@ def _part_verdict(ref, other, part_start: int, part_end: int,
     part = other[part_start:part_end]
     size = part.size
     lags, score = _scores(ref, part, (-(size // 10), ref.size - size + size // 10))
-    best = int(np.argmax(score))
-    peak = float(score[best])
+    best, peak, ratio = _peak(score)
     found = int(lags[best]) - part_start
-    if not np.isfinite(peak) or peak <= 0:
+    if peak <= 0:
         return "unclear", found
-    clear = _ratio(peak, _rival(score, best)) >= WEAK_RATIO
+    clear = ratio >= WEAK_RATIO
     if abs(found - lag) <= CONSISTENCY_SECONDS * FRAME_RATE:
         return ("agrees" if clear else "unclear"), found
     if clear:
@@ -344,6 +349,12 @@ def _part_verdict(ref, other, part_start: int, part_end: int,
     if _ratio(peak, floor) >= WEAK_RATIO and _ratio(expected, floor) >= WEAK_RATIO:
         return "disagrees", found
     return "unclear", found
+
+
+def _weak(match: Match, detail: str) -> Match:
+    """`match` demoted to weak, with why it isn't strong."""
+    match.strength, match.detail = "weak", detail
+    return match
 
 
 def find_offset(ref, other, require_window_agreement: bool = False) -> Match:
@@ -358,30 +369,25 @@ def find_offset(ref, other, require_window_agreement: bool = False) -> Match:
     of `other`'s active audio must each find the same lag on their own, and
     none may find its own match somewhere else.
     """
-    lag, _peak, ratio = _best_lag(ref, other)
+    lag, ratio = _best_lag(ref, other)
     match = Match(lag=lag / FRAME_RATE, strength=_strength(ratio), ratio=ratio)
     if match.strength == "none":
         match.detail = "no usable shared sound"
         return match
     if match.strength == "weak":
-        match.detail = "the best match barely stands out"
-        return match
+        return _weak(match, "the best match barely stands out")
 
     start = max(0, -lag)
     end = min(other.size, ref.size - lag)
     overlap = end - start
     needed = min(STRONG_MIN_OVERLAP_SECONDS * FRAME_RATE, int(0.9 * min(ref.size, other.size)))
     if overlap < needed:
-        match.strength = "weak"
-        match.detail = f"it rests on only {overlap // FRAME_RATE} s of overlap"
-        return match
+        return _weak(match, f"it rests on only {overlap // FRAME_RATE} s of overlap")
 
     active = min(_active_seconds(ref, start + lag, end + lag).size,
                  _active_seconds(other, start, end).size)
     if active < MIN_ACTIVE_SECONDS:
-        match.strength = "weak"
-        match.detail = f"it rests on only {active} s of sound"
-        return match
+        return _weak(match, f"it rests on only {active} s of sound")
 
     smallest = MIN_PART_SECONDS * FRAME_RATE
     sizes = [overlap // parts for parts in (3, 6, 12) if overlap // parts >= smallest]
@@ -393,24 +399,21 @@ def find_offset(ref, other, require_window_agreement: bool = False) -> Match:
                 continue
             verdict, found = _part_verdict(ref, other, part_start, part_start + size, lag)
             if verdict == "disagrees":
-                match.strength = "weak"
-                match.detail = (f"start and end disagree by {abs(found - lag) / FRAME_RATE:.1f} s: "
-                                f"clock drift, a paused recorder or an edited file")
-                return match
+                return _weak(match, f"start and end disagree by "
+                                    f"{abs(found - lag) / FRAME_RATE:.1f} s: clock drift, "
+                                    f"a paused recorder or an edited file")
 
     if require_window_agreement:
         agreeing, checked, spread, conflict = _window_agreement(ref, other, lag, start, end)
         match.windows_agreeing, match.windows_checked = agreeing, checked
         match.windows_spread = spread
         if conflict is not None:
-            match.strength = "weak"
-            match.detail = (f"one part of the file matches {conflict:.1f} s away: "
-                            f"clock drift, a paused recorder or an edited file")
-        elif agreeing < MIN_AGREEING_WINDOWS:
-            match.strength = "weak"
-            match.detail = (f"only {agreeing} of {checked} separate parts of the file "
-                            f"confirm it" if checked else
-                            "too little audio to confirm it in separate parts")
+            return _weak(match, f"one part of the file matches {conflict:.1f} s away: "
+                                f"clock drift, a paused recorder or an edited file")
+        if agreeing < MIN_AGREEING_WINDOWS:
+            return _weak(match, f"only {agreeing} of {checked} separate parts of the file "
+                                f"confirm it" if checked else
+                                "too little audio to confirm it in separate parts")
     return match
 
 
@@ -444,8 +447,8 @@ def _window_agreement(ref, other, lag: int, start: int,
     conflict.
     """
     active = _active_seconds(other, start, end)
-    per_window = MIN_WINDOW_SECONDS
-    count = 3 if active.size >= 3 * per_window else 2 if active.size >= 2 * per_window else 0
+    count = (3 if active.size >= 3 * MIN_WINDOW_SECONDS
+             else 2 if active.size >= 2 * MIN_WINDOW_SECONDS else 0)
     found = []
     conflict = None
     for k in range(count):
@@ -478,7 +481,6 @@ class Suggestion:
     method: str                   # "reference" | "matched" | "guess" | "error"
     reason: str
     strength: str | None = None   # "strong" | "weak" for a match
-    matched_with: Path | None = None
 
     @property
     def applicable(self) -> bool:
@@ -603,8 +605,7 @@ def suggest_offsets(units: list[Path], fingerprints: dict, current_offsets: dict
         offset = placed[via] + match.lag
         if match.strength == "strong" and not (explicit and offset < 0):
             placed[u] = offset
-            out[u] = Suggestion(u, offset, "matched", _match_reason(match, via),
-                                "strong", via)
+            out[u] = Suggestion(u, offset, "matched", _match_reason(match, via), "strong")
             return True
         if match.strength == "strong" and via == ref:
             before_reference.add(u)
@@ -647,7 +648,7 @@ def suggest_offsets(units: list[Path], fingerprints: dict, current_offsets: dict
                           f"{format_offset(-offset)} ({match.strength} match with {via.name})")
             else:
                 reason = _match_reason(match, via)
-            out[u] = Suggestion(u, offset, "matched", reason, match.strength, via)
+            out[u] = Suggestion(u, offset, "matched", reason, match.strength)
             continue
         guess = duration[ref] - duration[u]
         if explicit and guess < 0:
@@ -688,16 +689,15 @@ def decode_energy(path: Path, stream_index: int | None, should_stop):
 class AlignWorker(QThread):
     """Works out offset suggestions from the speaker files; applies nothing.
 
-    Each distinct stream is decoded once, at DECODE_RATE. `units` holds one (path, stream indices) pair per speaker file, as the
-    table showed them when Align was pressed, and `session_reference` the
-    same pair for the optional timing-only file. A run ends with
-    finished_ok(AlignmentResult), failed(message), or — when cancelled —
-    neither; QThread.finished follows in every case.
+    Each distinct stream is decoded once, at DECODE_RATE. `units` holds one
+    (path, stream indices) pair per speaker file, as the table showed them
+    when Align was pressed, and `session_reference` the same pair for the
+    optional timing-only file. A run ends with `result` (an AlignmentResult)
+    set, `error` (a message) set, or — when cancelled — neither, for the
+    window to read once QThread.finished arrives.
     """
 
     progress = Signal(int, str)       # percent, message
-    finished_ok = Signal(object)      # AlignmentResult
-    failed = Signal(str)
 
     def __init__(self, units: list[tuple[Path, list[int | None]]], current_offsets: dict,
                  session_reference: tuple[Path, list[int | None]] | None = None,
@@ -706,6 +706,8 @@ class AlignWorker(QThread):
         self.units = list(units)
         self.current_offsets = dict(current_offsets)
         self.session_reference = session_reference
+        self.result: AlignmentResult | None = None
+        self.error = ""
         self.cancelled = False
         self._stop = False
 
@@ -727,7 +729,7 @@ class AlignWorker(QThread):
         except Cancelled:
             self.cancelled = True
         except Exception as exc:  # a bug, not a bad file: say so rather than hang
-            self.failed.emit(f"Alignment failed: {exc}")
+            self.error = f"Alignment failed: {exc}"
 
     def _run(self) -> None:
         reference = self.session_reference[0] if self.session_reference else None
@@ -744,18 +746,18 @@ class AlignWorker(QThread):
                 raise
             except Exception as exc:
                 if path == reference:
-                    self.failed.emit(f"Couldn't use the session reference {path.name}: "
-                                     f"{exc}. No offsets were changed.")
+                    self.error = (f"Couldn't use the session reference {path.name}: "
+                                  f"{exc}. No offsets were changed.")
                     return
                 fingerprints[path] = exc
         units = [path for path, _streams in self.units]
         if reference is None and all(isinstance(fingerprints[u], Exception) for u in units):
-            self.failed.emit("None of the files could be read, so there was nothing "
-                             "to compare. No offsets were changed.")
+            self.error = ("None of the files could be read, so there was nothing "
+                          "to compare. No offsets were changed.")
             return
         self.progress.emit(100, "Aligning: comparing recordings…")
         result = suggest_offsets(units, fingerprints, self.current_offsets, reference,
                                  should_stop=self._should_stop)
         if self._stop:
             raise Cancelled
-        self.finished_ok.emit(result)
+        self.result = result
