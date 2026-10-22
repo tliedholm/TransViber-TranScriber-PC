@@ -1352,6 +1352,7 @@ class MainWindow(QMainWindow):
             track.segments.clear()
             track.status = TrackStatus.PENDING
             track.error = ""
+            track.note = ""
             self._set_status(i, track.status.value)
             self._progress_bar(i).setValue(0)
 
@@ -1376,6 +1377,7 @@ class MainWindow(QMainWindow):
         w.track_progress.connect(lambda i, p: self._progress_bar(i).setValue(p))
         w.track_done.connect(self._on_track_done)
         w.track_failed.connect(self._on_track_failed)
+        w.track_note.connect(self._on_track_note)
         w.finished_all.connect(self._on_finished)
         self._set_running(True)
         w.start()
@@ -1402,6 +1404,7 @@ class MainWindow(QMainWindow):
     def _on_track_started(self, i: int) -> None:
         track = self.tracks[i]
         track.segments.clear()  # a CPU-fallback retry restarts the track from scratch
+        track.note = ""
         track.status = TrackStatus.TRANSCRIBING
         self._set_status(i, TrackStatus.TRANSCRIBING.value)
         self._progress_bar(i).setValue(0)
@@ -1419,7 +1422,12 @@ class MainWindow(QMainWindow):
         track.status = TrackStatus.DONE
         track.language = language
         label = TrackStatus.DONE.value + (f" ({language})" if language else "")
-        self._set_status(i, label)
+        self._set_status(i, label + (" ⚠" if track.note else ""))
+        self.table.item(i, COL_STATUS).setToolTip(track.note)
+
+    @Slot(int, str)
+    def _on_track_note(self, i: int, note: str) -> None:
+        self.tracks[i].note = note
 
     @Slot(int, str)
     def _on_track_failed(self, i: int, message: str) -> None:

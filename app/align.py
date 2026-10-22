@@ -63,7 +63,11 @@ RUNNER_UP_EXCLUSION_SECONDS = 0.5   # the peak's own shoulders aren't a rival
 # drift, a paused recorder, an edited file). Shrinking the parts towards each
 # end is what reaches a cut near the start or the end: the part straddling it
 # mostly agrees, the smaller part beyond it doesn't. A cut within about 40 s
-# of either end is still beyond them.
+# of either end is still beyond them. The fractions need 240 s of overlap to
+# be MIN_PART_SECONDS long; the end parts only need room for two of them that
+# don't overlap, so a short match is checked too. Under 160 s of overlap
+# (a strong match there means a recording under about three minutes) there
+# is nothing to check with, and an edit goes unseen.
 CONSISTENCY_SECONDS = 0.1
 MIN_PART_SECONDS = 80       # a part shorter than this is too little to judge
 # Against a full-session reference a strong match also has to be found again,
@@ -395,12 +399,13 @@ def find_offset(ref, other, require_window_agreement: bool = False) -> Match:
 
     A strong peak is then checked before it is called strong. It must rest
     on enough overlap and enough sound in each file, and no part of the
-    overlap — its first and last thirds, sixths, twelfths and 80 s — may
-    clearly find its own match somewhere else: one fixed offset can't fit both
-    (drift, a pause, an edit). With `require_window_agreement` — every match
-    against a full-session reference, direct or chained — separate stretches
-    of `other`'s active audio must each find the same lag on their own, and
-    none may find its own match somewhere else.
+    overlap — its first and last thirds, sixths, twelfths and 80 s, those that
+    fit (`_part_sizes`) — may clearly find its own match somewhere else: one
+    fixed offset can't fit both (drift, a pause, an edit). With
+    `require_window_agreement` — every match against a full-session
+    reference, direct or chained — separate stretches of `other`'s active
+    audio must each find the same lag on their own, and none may find its own
+    match somewhere else.
     """
     transforms = _Transforms(ref)
     lag, ratio = _best_lag(ref, other, transforms)
@@ -423,11 +428,7 @@ def find_offset(ref, other, require_window_agreement: bool = False) -> Match:
     if active < MIN_ACTIVE_SECONDS:
         return _weak(match, f"it rests on only {active} s of sound")
 
-    smallest = MIN_PART_SECONDS * FRAME_RATE
-    sizes = [overlap // parts for parts in (3, 6, 12) if overlap // parts >= smallest]
-    if sizes:
-        sizes.append(smallest)      # reaches a cut down to about 40 s from either end
-    for size in sizes:
+    for size in _part_sizes(overlap):
         for part_start in (start, end - size):
             if _active_seconds(other, part_start, part_start + size).size < MIN_ACTIVE_SECONDS:
                 continue
@@ -451,6 +452,22 @@ def find_offset(ref, other, require_window_agreement: bool = False) -> Match:
                                 f"confirm it" if checked else
                                 "too little audio to confirm it in separate parts")
     return match
+
+
+def _part_sizes(overlap: int) -> list[int]:
+    """Frames per part for the edit check on `overlap` frames, largest first.
+
+    The first and last third, sixth and twelfth, where each is at least
+    MIN_PART_SECONDS, and MIN_PART_SECONDS itself — which reaches a cut down
+    to about 40 s from either end — wherever its two parts don't overlap. A
+    fraction that comes out at exactly MIN_PART_SECONDS is the same part, and
+    is checked once.
+    """
+    smallest = MIN_PART_SECONDS * FRAME_RATE
+    sizes = {overlap // parts for parts in (3, 6, 12) if overlap // parts >= smallest}
+    if overlap >= 2 * smallest:
+        sizes.add(smallest)
+    return sorted(sizes, reverse=True)
 
 
 def _active_seconds(other, start: int, end: int):

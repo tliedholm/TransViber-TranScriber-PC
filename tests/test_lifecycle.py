@@ -153,6 +153,20 @@ class WindowLifecycle(_WindowTest):
         self.window._set_status(0, "Pending")
         self.assertEqual(item.toolTip(), "")
 
+    def test_a_timing_note_shows_on_the_finished_track(self):
+        w = self.window
+        self.add(Track(Path("audio.wav"), "Alice"))
+        item = w.table.item(0, main_window.COL_STATUS)
+        w._on_track_started(0)
+        w._on_track_note(0, "Its timestamps jump back at 0:05.")
+        w._on_track_done(0, "en")
+        self.assertEqual((item.text(), item.toolTip()),
+                         ("Done (en) ⚠", "Its timestamps jump back at 0:05."))
+        # A retry (the CPU fallback) starts the track again, note and all.
+        w._on_track_started(0)
+        w._on_track_done(0, "en")
+        self.assertEqual((item.text(), item.toolTip()), ("Done (en)", ""))
+
 
 class LanguageChoices(_WindowTest):
     """Languages the chosen model can't take: greyed out, and flagged and

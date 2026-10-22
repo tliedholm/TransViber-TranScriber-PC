@@ -8,6 +8,7 @@ import cuda_setup  # noqa: F401  (must run before ctranslate2 loads)
 
 from PySide6.QtCore import QThread, Signal
 
+from audio import AudioFileError
 from models import Segment, Track
 
 # A pause this long between words splits a Whisper segment in two. Whisper can
@@ -368,6 +369,7 @@ class TranscribeWorker(QThread):
     track_progress = Signal(int, int)  # (track index, percent)
     track_done = Signal(int, str)  # (track index, detected language)
     track_failed = Signal(int, str)  # (track index, error message)
+    track_note = Signal(int, str)  # (track index, what its timestamps ran into)
     finished_all = Signal(bool)  # cancelled?
 
     def __init__(self, tracks: list[Track], indices: list[int], model_name: str,
@@ -395,6 +397,23 @@ class TranscribeWorker(QThread):
             self.device = "cpu"
             return _get_model(self.model_name, self.device, self.model_status.emit)
 
+    def _decode(self, i: int):
+        """Track i's audio, 16 kHz mono on its file's own clock.
+
+        Every engine decodes here, Whisper included: faster-whisper's own
+        decoder ignores timestamps (see audio.py), so a gap or a late start
+        in the file would move every word after it.
+        """
+        from audio import Timing, decode_track_audio
+
+        track = self.tracks[i]
+        timing = Timing()
+        audio = decode_track_audio(track.path, track.stream_index, track.channel, timing)
+        note = timing.summary()
+        if note:
+            self.track_note.emit(i, note)
+        return audio
+
     def _transcribe_track(self, model, i: int) -> bool:
         """Transcribe one track. Returns True if cancelled mid-track."""
         engine = engine_for(self.model_name)
@@ -404,12 +423,9 @@ class TranscribeWorker(QThread):
             return self._transcribe_track_qwen(model, i)
         track = self.tracks[i]
         self.track_started.emit(i)
-        if track.is_subtrack:
-            from audio import decode_track_audio
-
-            source = decode_track_audio(track.path, track.stream_index, track.channel)
-        else:
-            source = str(track.path)
+        source = self._decode(i)
+        if self._stop:
+            return True
         segments, info = model.transcribe(
             source,
             language=self.language,
@@ -443,11 +459,9 @@ class TranscribeWorker(QThread):
         """
         from faster_whisper.vad import VadOptions, get_speech_timestamps
 
-        from audio import decode_track_audio
-
         track = self.tracks[i]
         self.track_started.emit(i)
-        audio = decode_track_audio(track.path, track.stream_index, track.channel)
+        audio = self._decode(i)
         if self._stop:
             return True
 
@@ -586,11 +600,9 @@ class TranscribeWorker(QThread):
 
     def _transcribe_track_onnx(self, model, i: int) -> bool:
         """Transcribe one track with an onnx-asr model (Parakeet etc.)."""
-        from audio import decode_track_audio
-
         track = self.tracks[i]
         self.track_started.emit(i)
-        audio = decode_track_audio(track.path, track.stream_index, track.channel)
+        audio = self._decode(i)
         if self._stop:
             return True
         duration = len(audio) / 16000
@@ -635,6 +647,8 @@ class TranscribeWorker(QThread):
                 break
             try:
                 cancelled = self._transcribe_track(model, i)
+            except AudioFileError as exc:  # the file itself: the CPU would read it no better
+                self.track_failed.emit(i, str(exc))
             except Exception as exc:
                 if self._stop:
                     cancelled = True
