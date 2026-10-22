@@ -176,7 +176,9 @@ of these easily.
 Note for future package updates: `onnxruntime-gpu` must come from Microsoft's
 CUDA 12 index (`--index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/`);
 the default PyPI build targets CUDA 13 and won't find the pip-installed
-CUDA 12 DLLs. Don't reinstall plain `onnxruntime` alongside it.
+CUDA 12 DLLs. Don't reinstall plain `onnxruntime` alongside it: both install
+into the same `onnxruntime` folder, and the CPU one wins. See
+[Setting up from source](#setting-up-from-source) for the install order.
 
 ## How the merge works
 
@@ -217,15 +219,39 @@ server and the model weights are left out (see `.gitignore`), so a fresh
 clone needs them recreated before the app runs. You need Windows, an NVIDIA
 GPU with a current driver, and Python 3.14.
 
-1. Create the venv and install the pinned packages. Install torch first,
-   from PyTorch's own index, so the CUDA build isn't replaced by the CPU one:
+1. Create the venv and install the pinned packages. torch and ONNX Runtime
+   go in first, each from its own index, because neither CUDA 12 build is on
+   PyPI: PyPI's torch is the CPU build, and PyPI's `onnxruntime-gpu` is built
+   for CUDA 13 from 1.27 on (and has no 1.27.1 at all). The lock then goes in
+   with `--no-deps`, since it already lists every package; without that,
+   faster-whisper pulls in the CPU `onnxruntime`, which overwrites the CUDA
+   build's files.
 
    ```bat
    py -3.14 -m venv .venv
    .venv\Scripts\python.exe -m pip install --upgrade pip
    .venv\Scripts\python.exe -m pip install torch==2.11.0+cu128 ^
        --index-url https://download.pytorch.org/whl/cu128
-   .venv\Scripts\python.exe -m pip install -r requirements.lock.txt
+   .venv\Scripts\python.exe -m pip install onnxruntime-gpu==1.27.1 --no-deps ^
+       --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
+   .venv\Scripts\python.exe -m pip install --no-deps -r requirements.lock.txt
+   ```
+
+   To check the result, this should print `1.27.1 12.8`:
+
+   ```bat
+   .venv\Scripts\python.exe -c "import onnxruntime as o; from onnxruntime.capi import build_and_package_info as b; print(o.__version__, b.cuda_version)"
+   ```
+
+   `pip check` will report that faster-whisper requires `onnxruntime`; that
+   one is expected, since `onnxruntime-gpu` provides the same module. If the
+   check prints anything else or fails, or Parakeet only runs on the CPU,
+   remove both builds and install the right one again:
+
+   ```bat
+   .venv\Scripts\python.exe -m pip uninstall -y onnxruntime onnxruntime-gpu
+   .venv\Scripts\python.exe -m pip install onnxruntime-gpu==1.27.1 --no-deps ^
+       --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
    ```
 
 2. For AI Notes, download the llama.cpp Windows CUDA x64 build (release
@@ -250,9 +276,10 @@ GPU with a current driver, and Python 3.14.
   official llama.cpp CUDA build, b10034) is in the project folder and the
   app starts/stops it as needed.
 - `requirements.lock.txt` pins every package in that venv, with the order to
-  install them in (torch first, from PyTorch's own index — the `+cu128`
-  build is not on PyPI). It is a record of what this build was verified
-  against; regenerate it with `pip freeze` after changing the venv.
+  install them in (torch, then onnxruntime-gpu, each from its own index —
+  neither CUDA 12 build is on PyPI) and the hash of the exact onnxruntime-gpu
+  wheel. It is a record of what this build was verified against; regenerate
+  it with `pip freeze` after changing the venv.
 - `tests/` holds the offline regression tests — no GPU, no downloads, a few
   seconds:
   `.venv\Scripts\python.exe -m unittest discover -s tests -t .`

@@ -395,6 +395,12 @@ come from pip wheels. `cuda_setup.py` adds their directories to the DLL
 search path **and must be imported before ctranslate2/faster_whisper load**
 (`transcriber.py` imports it first, `# noqa: F401`). In the frozen build the
 DLLs come from torch's bundled `torch/lib` set instead of the nvidia wheels.
+Whatever loads them has to be a CUDA 12 build: torch is `+cu128` from
+PyTorch's index, and onnxruntime-gpu comes from Microsoft's CUDA 12 feed,
+because PyPI's is built for CUDA 13 from 1.27 on. `pip freeze` records
+neither source, so the install order and the onnxruntime wheel's hash live
+in the header of `requirements.lock.txt`; change it and the README's setup
+steps together.
 
 `runtime.py` centralizes every path that differs between source and the
 PyInstaller build (`IS_FROZEN`): `bundle_dir()` (read-only bundled data),
