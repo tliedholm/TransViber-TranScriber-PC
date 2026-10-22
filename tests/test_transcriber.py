@@ -1,14 +1,23 @@
-"""ASR-side logic that runs without a model: splitting, routing, script checks."""
+"""ASR-side logic that runs without a model: splitting, routing, script checks,
+and what the worker hands a model."""
 
 from __future__ import annotations
 
+import tempfile
 import unittest
 from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import numpy as np
 
 import tests  # noqa: F401  (puts app/ on sys.path)
 
 import transcriber
-from transcriber import SPLIT_GAP_SECONDS, engine_for, split_on_word_gaps
+from models import Track
+from tests.test_audio import noise, write_mkv
+from transcriber import SPLIT_GAP_SECONDS, TranscribeWorker, engine_for, split_on_word_gaps
 
 
 @dataclass
@@ -97,6 +106,62 @@ class ForeignScript(unittest.TestCase):
 
     def test_punctuation_and_digits_do_not_decide(self):
         self.assertFalse(transcriber._foreign_script("123 — ...!", "en"))
+
+
+class _Whisper:
+    """Stands in for a loaded faster-whisper model: keeps what it was given."""
+
+    def transcribe(self, source, **_options):
+        self.source = source
+        return [], SimpleNamespace(duration=len(source) / 16000, language="en")
+
+
+class Decoding(unittest.TestCase):
+    """What the worker hands a model, and what it does when the file is the problem."""
+
+    def run_worker(self, track: Track, device: str = "cpu"):
+        model = _Whisper()
+        worker = TranscribeWorker([track], [0], "large-v3", device, None)
+        notes, failures = [], []
+        worker.track_note.connect(lambda _i, note: notes.append(note))
+        worker.track_failed.connect(lambda _i, message: failures.append(message))
+        with patch.object(worker, "_load_model", return_value=model), \
+                patch("transcriber._get_model") as reload:
+            worker.run()
+        return model, worker, notes, failures, reload
+
+    def test_whisper_reads_through_the_apps_decoder(self):
+        # Given the path, faster-whisper would decode it itself and close the
+        # two-second gap: "later" would be heard a second after "earlier".
+        with tempfile.TemporaryDirectory() as folder:
+            path = write_mkv(Path(folder, "gap.mkv"), [[(0, noise(1, 1)), (3, noise(1, 2))]])
+            model, _worker, notes, failures, _reload = self.run_worker(Track(path, "Alice"))
+        self.assertIsInstance(model.source, np.ndarray)
+        self.assertEqual(len(model.source), 4 * 16000)
+        self.assertEqual((notes, failures), ([], []))
+
+    def test_a_timing_note_goes_out_with_the_track(self):
+        with tempfile.TemporaryDirectory() as folder:
+            first, second = Path(folder, "one.ts"), Path(folder, "two.ts")
+            for path, seconds in ((first, 2), (second, 1)):
+                write_mkv(path, [[(0, noise(seconds, 3))]], frame=1152, fmt="mpegts",
+                          codec="mp2")
+            joined = Path(folder, "joined.ts")
+            joined.write_bytes(first.read_bytes() + second.read_bytes())
+            _model, _worker, notes, failures, _reload = self.run_worker(Track(joined, "Alice"))
+        self.assertEqual(failures, [])
+        (note,) = notes
+        self.assertIn("jump back at 0:02", note)
+
+    def test_a_problem_with_the_file_fails_the_track_without_moving_to_the_cpu(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = write_mkv(Path(folder, "one.mkv"), [[(0, noise(1, 4))]])
+            track = Track(path, "Alice", stream_index=3)
+            _model, worker, _notes, failures, reload = self.run_worker(track, "cuda")
+        (failure,) = failures
+        self.assertIn("has no audio stream 4", failure)
+        self.assertEqual(worker.device, "cuda")
+        reload.assert_not_called()
 
 
 if __name__ == "__main__":

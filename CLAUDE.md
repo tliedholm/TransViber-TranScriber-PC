@@ -161,6 +161,59 @@ separated by silence into one segment, which would sort a speaker's later
 remark at the time of their earlier one and break the interleaving. Segments
 are split at word-level silence gaps (`split_on_word_gaps`) to prevent this.
 
+### Decoding on the file's clock
+
+Every engine and Align decode through `audio.py` (`decode_track_audio`,
+`iter_stream_power`), and both follow the file's own timestamps instead of
+laying decoded audio end to end. Two clocks, kept apart: the **source
+clock**, one 0:00 for every stream in a file (`container.start_time`; a
+file that declares none, like WAV, is measured from its earliest packet
+timestamp), and the **session clock**, which `Track.offset` maps the file
+onto in `merge_tracks`. A stream that began after the others starts with
+that much silence, a gap in the timestamps (a paused recorder, a lost
+packet) stays a gap, and a file whose clock starts at 10 s starts at 0:00
+with no padding. Laid end to end, which is what faster-whisper's own decoder
+does (so Whisper is handed the decoded array, never the path), a late
+stream lands at 0:00 and everything after a gap moves earlier, and no single
+offset can repair that: each stream and each stretch would need its own.
+Align summed a file's streams from sample 0 too, and a file whose second
+stream began a minute late matched strongly, every part agreeing, a minute
+out.
+
+The rules, in `_timed_blocks` and `_placed`:
+
+- A frame within `TIMING_TOLERANCE` (20 ms) of where the audio before it
+  ended is rounding (Matroska keeps milliseconds) and follows on. Beyond
+  it, the resampler is flushed and started again, so it never blends audio
+  across a gap, and the new run is placed by its exact timestamp. The
+  per-frame check is in floats: Fractions on every frame cost Align a
+  tenth more time reading a file.
+- Later is silence. Earlier, including before 0:00, plays on from where the
+  audio had got to; every later timestamp is read that much later, as a
+  clock that restarted (two recordings joined end to end); and the jump is
+  noted. Audio is never dropped, so a damaged clock costs timing, not words.
+- No timestamp: the frame follows on, and a run that began without one ends
+  at the first frame that has one.
+- A packet that won't decode is skipped and counted, its place left silent
+  by the timestamps after it; only a stream where nothing decodes fails.
+  faster-whisper's decoder stopped at the first one, cutting the file short.
+- Silence is only made up to `MAX_TIMELINE_SECONDS` (24 h) into a file;
+  past that, `AudioFileError`, before anything is allocated for it. Align
+  gets a long gap as zero power, `SILENCE_CHUNK_SECONDS` at a time, so it
+  stays cancellable.
+- `AudioFileError` is the file's own problem: `TranscribeWorker.run` fails
+  that track without the GPU-to-CPU retry, which would read it no better
+  and leave every later track on the CPU.
+- What decoding ran into (`Timing`: jumps back, damaged packets) reaches the
+  track as `Track.note`, shown as "Done ⚠" with the note as its tooltip.
+
+WMA's decoder stamps its first frame 86 ms in; that is followed like any
+other timestamp. `decode_track_audio` writes into one array sized from the
+stream's declared duration rather than gathering chunks and joining them:
+a four-hour track at 16 kHz is nearly a gigabyte, and the join held two.
+On an hour of 48 kHz AAC that halved peak memory and cut decoding time by
+about 40%; Align's read took the same time as before.
+
 ### Track alignment
 
 **Align…** suggests offsets from sound the recordings share, and applies
@@ -168,8 +221,9 @@ only what the user ticks in its review window (`AlignReviewDialog`). Nothing
 is ever applied automatically; a typed value is the undo.
 
 - **Evidence.** `AlignWorker` decodes each stream once through
-  `audio.iter_stream_power` at 8 kHz (a file is one unit: all its rows,
-  their streams' energies summed), keeping only a 100-per-second *onset
+  `audio.iter_stream_power` at 8 kHz, on the file's clock (a file is one
+  unit: all its rows, their streams' energies summed where each began),
+  keeping only a 100-per-second *onset
   fingerprint*: the rises in log frame energy, less a 1 s moving average.
   Power is summed over every channel, not taken from a mono downmix, which
   gives an LFE-labelled channel (the 4th of 5.1) no weight — in a multitrack
@@ -272,7 +326,8 @@ is ever applied automatically; a typed value is the undo.
 
 `engine_for(model_name)` in `transcriber.py` routes each model to one of:
 - **whisper** — faster-whisper / CTranslate2 (default; the `.transcribe`
-  path with `word_timestamps`, `hotwords`, VAD).
+  path with `word_timestamps`, `hotwords`, VAD), given the array from
+  `decode_track_audio` like the others, never the file's path.
 - **onnx** — onnx-asr / ONNX Runtime for NVIDIA Parakeet & Canary
   (`_transcribe_track_onnx`). Ignores the Language dropdown (auto-detect).
 - **qwen** — Qwen3-ASR via the `qwen-asr` package + a forced aligner for
@@ -448,6 +503,14 @@ What is pinned, and why it is worth keeping pinned:
   everything downstream assumes; `test_merger` also pins the
   `MAX_COALESCE_CHARS` invariant that `llm.py`'s line-boundary splitting
   depends on, which is otherwise only a comment reaching across two modules.
+  `test_transcriber.Decoding` pins what the worker hands a model (Whisper
+  gets the decoded array) and that a file problem never moves to the CPU.
+- `test_audio` — decoding on the file's clock, on files it writes with PyAV:
+  a gap, a stream that began late, a clock that starts at 10 s, one channel
+  against the whole stream, frame sizes and rates, an ordinary WAV sample
+  for sample as before, two MPEG-TS recordings joined end to end, the
+  timeline limit; and `_placed`'s rules on bare positions, with damaged
+  packets and missing timestamps through a stand-in container.
 - `test_exporters` — timestamp formats, VTT escaping, and `target_paths`
   (the "Session 2.5" case, where `with_suffix` would write a file the user
   never named).
@@ -457,7 +520,8 @@ What is pinned, and why it is worth keeping pinned:
   pins the matcher on synthetic sessions (lag direction, what is never
   labelled strong, window agreement, the drift check), the chaining and
   session-reference rules through a scripted matcher, the worker's failure
-  and cancel paths, and one real PyAV decode of WAVs it writes itself.
+  and cancel paths, and real PyAV decodes of files it writes itself,
+  including a two-stream MKV whose second stream began a minute late.
 - `test_llm` — catalog integrity, model resolution, and the identity policy,
   including that a typed `repo::file.gguf` gets the same policy as its
   alias. Prompt sizing is exercised through a `NotesWorker` subclass whose
@@ -495,5 +559,6 @@ way — `--selftest` is where real inference gets verified.
   drag-drop and the file dialog.
 - A multitrack file expands into per-speaker `Track`s in `tracks_for_file`:
   multiple audio streams → one track per stream; >2 channels → one per
-  channel; stereo stays one speaker unless split. Sub-tracks
-  (`Track.is_subtrack`) are decoded on demand by `decode_track_audio`.
+  channel; stereo stays one speaker unless split. Every track, a sub-track
+  (`Track.is_subtrack`) or a whole file, is decoded on demand by
+  `decode_track_audio`.

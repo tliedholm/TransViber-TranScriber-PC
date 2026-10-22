@@ -53,6 +53,7 @@ def _selftest(argv: list[str]) -> int:
             lambda i, s: print(f"  [{s.start:7.2f}-{s.end:7.2f}] {s.speaker}: {s.text.strip()}"))
         worker.track_failed.connect(
             lambda i, m: (print(f"  FAILED: {m}"), failures.append(f"{model_name}: {m}")))
+        worker.track_note.connect(lambda i, m: print(f"  note: {m}"))
         worker.run()  # synchronously, in this thread
         transcriber.free_asr_models()
 

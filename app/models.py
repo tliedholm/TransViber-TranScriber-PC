@@ -39,6 +39,9 @@ class Track:
     status: TrackStatus = TrackStatus.PENDING
     language: str = ""
     error: str = ""
+    # What decoding ran into on the way (timestamps that jump back, damaged
+    # packets skipped): the transcript is there, but its times may be off.
+    note: str = ""
     segments: list[Segment] = field(default_factory=list)
     # Set when this track is a slice of a multitrack file: an audio stream
     # within the container, and optionally a single channel of that stream.

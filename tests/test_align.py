@@ -886,6 +886,29 @@ class RealDecode(unittest.TestCase):
         self.assertEqual(rows["edited"].strength, "weak")
         self.assertIn("start and end disagree by 5.0 s", rows["edited"].reason)
 
+    def test_a_stream_that_began_late_keeps_its_place(self):
+        # One file holding two speakers' streams, the second begun a minute
+        # in, against a room recording that heard both. Read from 0:00, the
+        # late stream (the first speaker says little) made the whole file look
+        # a minute late — strong, with all three parts agreeing — and applying
+        # that moved the first speaker's words a minute late too.
+        from tests.test_audio import write_mkv
+
+        rate = align.DECODE_RATE
+        a, b = speech(360, 70, talk=0.1), speech(300, 71)
+        room = a + np.concatenate([np.zeros(60 * FRAME_RATE), b]) + hiss(360, 72)
+        with tempfile.TemporaryDirectory() as folder:
+            reference = _write_wav(Path(folder, "room.wav"), room, 1)
+            both = write_mkv(Path(folder, "both.mkv"),
+                             [[(0, _shaped_noise(a + hiss(360, 73), 2)[:, None])],
+                              [(60, _shaped_noise(b + hiss(300, 74), 3)[:, None])]],
+                             rate=rate)
+            worker = AlignWorker([(both, [0, 1])], {}, (reference, [None]))
+            worker.run()
+        self.assertEqual(worker.error, "")
+        (row,) = worker.result.suggestions
+        self.assertEqual((row.strength, row.offset), ("strong", 0.0))
+
     def test_every_channel_of_a_multichannel_file_is_heard(self):
         # A mono downmix weights the LFE position (the 3rd of three channels,
         # the 4th of six) at zero; that can be someone's microphone.
