@@ -126,7 +126,15 @@ engines and NumPy stay unloaded until needed. The source `.bat` and
 
 Shutdown is asynchronous: `closeEvent` disables the UI, requests
 cancellation, and retries via a timer until every worker has stopped.
-Never accept a close while a QThread is running. Stats polling has an
+Never accept a close while a QThread is running. A job counts as stopped
+once its finish handler has run (the window drops its reference there),
+not when `isRunning()` turns false: the last notes chunks can still be
+queued behind a finished thread. Only then are the notes saved for the
+last time, and a failed save keeps the window open behind one prompt
+(Retry / Save Elsewhere / Return to App / Close Without Saving); the
+stats poller is left running until that is settled, so returning to the
+app needs nothing restarted. The finish handlers reset their controls
+even while closing, and skip only status text and dialogs. Stats polling has an
 interruptible wait; notes startup checks cancellation before/after downloads
 and while waiting for the server. Cancel AI Notes kills a stalled stream.
 The ASR model stays cached between runs and is released when its model/device
@@ -424,7 +432,11 @@ it never lands in the project tree) and is written through
 `runtime.write_atomic`: a temp file plus `os.replace`, because the autosave
 fires a few seconds after every keystroke and an interrupted in-place write
 would destroy the thing the autosave exists to protect. `_read_notes_text`
-migrates an old registry value across once.
+migrates an old registry value across once. `_notes_dirty` is set by every
+change, typed or streamed, and cleared only by a write that succeeded, so
+an untouched document is never rewritten and a failed write is never
+forgotten. A file that could not be read is never written over: notes
+added after that can only be saved elsewhere, or knowingly dropped.
 
 ### Tests
 
@@ -472,7 +484,10 @@ What is pinned, and why it is worth keeping pinned:
   review window by replacing only its `exec()`. Each test deletes its
   window in cleanup rather than leaving it to the garbage collector:
   collecting a `MainWindow` crashes PySide6 6.11.1 (the pinned version)
-  with an access violation partway through a later test.
+  with an access violation partway through a later test. `NotesOnClose`
+  streams AI notes from a real thread to pin the close-time save: a
+  thread that has stopped with its last chunks still queued must not let
+  the window close before they are in the file.
 
 Nothing here touches a GPU, a model or the network, and it should stay that
 way — `--selftest` is where real inference gets verified.

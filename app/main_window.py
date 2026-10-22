@@ -436,7 +436,15 @@ class MainWindow(QMainWindow):
         self._align_fingerprints: dict = {}
         self.has_cuda: bool | None = None
         self._closing = False
+        # Every change to the notes sets it; only a write that succeeded
+        # clears it. A close never drops notes it could not write unasked.
+        self._notes_dirty = False
+        self._notes_save_error = ""
         self._notes_load_failed = False
+        # Closing: whether the notes are dealt with (written, or the user chose
+        # what to do instead), and whether the prompt asking is open.
+        self._notes_settled = False
+        self._asking_about_notes = False
 
         self._build_ui()
         self._transcript_blocks: list[str] = []
@@ -754,7 +762,7 @@ class MainWindow(QMainWindow):
         self._notes_save_timer.setInterval(3000)
         self._notes_save_timer.setSingleShot(True)
         self._notes_save_timer.timeout.connect(self._save_notes_text)
-        self.notes_edit.textChanged.connect(self._notes_save_timer.start)
+        self.notes_edit.textChanged.connect(self._on_notes_changed)
         notes_top.addWidget(notes_right)
         notes_top.setStretchFactor(0, 0)
         notes_top.setStretchFactor(1, 1)
@@ -800,9 +808,8 @@ class MainWindow(QMainWindow):
             self.combo_device.setCurrentIndex(1)
         self.device_label.setText(
             "GPU: CUDA available" if available else "GPU not available — using CPU")
-        if not self._closing:
-            self.combo_device.setEnabled(self.worker is None)
-            self.btn_transcribe.setEnabled(self.notes_worker is None)
+        self.combo_device.setEnabled(self.worker is None)
+        self.btn_transcribe.setEnabled(self.notes_worker is None)
 
     def _tick_elapsed(self) -> None:
         if self._run_started is not None:
@@ -1191,6 +1198,7 @@ class MainWindow(QMainWindow):
         self.align_worker = None
         self._align_fingerprints.update(worker.fingerprints)
         if self._closing:
+            self._update_busy()     # in step again should the close be called off
             return
         result = worker.result
         if result is None:      # failed or cancelled
@@ -1378,8 +1386,6 @@ class MainWindow(QMainWindow):
         if self.worker is not None:
             self.worker.wait()
             self.worker = None
-        if self._closing:
-            return
         if cancelled:
             for i, track in enumerate(self.tracks):
                 if track.status == TrackStatus.TRANSCRIBING:
@@ -1399,9 +1405,11 @@ class MainWindow(QMainWindow):
             msg = f"Finished with {len(errors)} error(s)"
         else:
             msg = f"Transcription complete{took}"
-        self.statusBar().showMessage(msg)
         self._set_running(False)
         self._render_transcript()
+        if self._closing:
+            return  # reset all the same, should the close be called off
+        self.statusBar().showMessage(msg)
         if errors and not cancelled:
             detail = "\n\n".join(f"{t.source_label}:\n{t.error}" for t in errors[:5])
             QMessageBox.warning(self, "Some tracks failed", detail)
@@ -1592,8 +1600,6 @@ class MainWindow(QMainWindow):
             cancelled = self.notes_worker.cancelled
             self.notes_worker = None
         llm.free_llm()
-        if self._closing:
-            return
         self._notes_elapsed_timer.stop()
         stats = ""
         if self._notes_run_started is not None:
@@ -1609,6 +1615,8 @@ class MainWindow(QMainWindow):
         self.btn_ai_notes.setEnabled(True)
         self.btn_transcribe.setEnabled(True)
         self.combo_notes_model.setEnabled(True)
+        if self._closing:
+            return  # reset all the same, should the close be called off
         # Kept in the status bar until the next status change, so the run's
         # numbers can be noted down. A cancelled run says so: on the
         # map-reduce path "done" would be describing unmerged part notes.
@@ -1623,38 +1631,59 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "AI notes failed", message)
 
     def export_notes_dialog(self) -> None:
-        text = self.notes_edit.toPlainText()
-        if not text.strip():
+        if not self.notes_edit.toPlainText().strip():
             QMessageBox.information(self, "No notes", "There are no notes to export yet.")
             return
+        self._write_notes_copy("Export notes")
+
+    def _write_notes_copy(self, title: str) -> bool:
+        """Ask for a file and write the notes to it; True once written."""
         path_str, _ = QFileDialog.getSaveFileName(
-            self, "Export notes", str(Path.home() / "notes.md"),
+            self, title, str(Path.home() / "notes.md"),
             "Markdown (*.md);;Plain text (*.txt)")
         if not path_str:
-            return
+            return False
         try:
-            Path(path_str).write_text(text, encoding="utf-8")
-            self.statusBar().showMessage(f"Notes exported to {path_str}")
+            Path(path_str).write_text(self.notes_edit.toPlainText(), encoding="utf-8")
         except OSError as exc:
             QMessageBox.critical(self, "Export failed", str(exc))
+            return False
+        self.statusBar().showMessage(f"Notes exported to {path_str}")
+        return True
 
     # ---------- Settings persistence ----------
 
-    def _save_notes_text(self) -> None:
-        """Write the Notes tab to disk, atomically.
+    def _on_notes_changed(self) -> None:
+        """Typing and streamed AI notes alike: unsaved until a write succeeds."""
+        self._notes_dirty = True
+        if not self._closing:  # a close saves once the last chunk is in
+            self._notes_save_timer.start()
+
+    def _save_notes_text(self) -> bool:
+        """Write the Notes tab to disk, atomically; True once the file holds
+        what the editor does. Nothing changed since the last save, nothing
+        is written.
 
         Failures appear in the status bar: a modal error after every edit
-        would be unusable. The text stays in the editor and is retried on
-        the next edit and on close. A failed initial read disables autosave
-        so an empty editor cannot overwrite the saved document.
+        would be unusable. The text stays in the editor, still unsaved, and
+        is retried on the next edit and on close, which will not go ahead
+        without it (see _settle_unsaved_notes). A failed initial read
+        disables saving so an empty editor cannot overwrite the saved
+        document.
         """
+        if not self._notes_dirty:
+            return True
         if self._notes_load_failed:
-            return  # never overwrite a document we failed to read
+            return False  # never overwrite a document we failed to read
         try:
             runtime.write_atomic(runtime.notes_path(),
                                  self.notes_edit.toPlainText())
         except OSError as exc:
+            self._notes_save_error = str(exc)
             self.statusBar().showMessage(f"Notes could not be saved: {exc}")
+            return False
+        self._notes_dirty = False
+        return True
 
     def _read_notes_text(self) -> str:
         """The saved notes, migrating them out of the registry on first run."""
@@ -1711,9 +1740,9 @@ class MainWindow(QMainWindow):
         self._update_hints_visibility()
 
     def _save_settings(self) -> None:
-        # The notes themselves are a file, not a registry value — see
+        # The notes themselves are a file, not a registry value, saved on
+        # their own so that a failure can stop the close — see
         # _save_notes_text.
-        self._save_notes_text()
         settings = QSettings()
         settings.setValue("hints", self.edit_hints.toPlainText())
         settings.setValue("ai_instructions", self.edit_ai_instructions.toPlainText())
@@ -1728,31 +1757,102 @@ class MainWindow(QMainWindow):
     # ---------- Shutdown ----------
 
     def closeEvent(self, event) -> None:
+        if self._asking_about_notes:
+            event.ignore()  # a timer tick, or another click, under the prompt
+            return
         if not self._closing:
             self._closing = True
             self._notes_save_timer.stop()
+            self._save_notes_text()  # a first copy now, should stopping take long
             self._save_settings()
             self.centralWidget().setEnabled(False)
             self.statusBar().showMessage("Closing — waiting for background work to stop…")
-            if self.worker is not None:
-                self.worker.stop()
-            if self.notes_worker is not None:
-                self.notes_worker.stop()
-            if self.align_worker is not None:
-                self.align_worker.stop()
-            self.stats_poller.stop()
+            for job in (self.worker, self.notes_worker, self.align_worker):
+                if job is not None:
+                    job.stop()
         # Never destroy a running QThread. Keep the event loop alive for its
         # queued signals; a model download/load may not be interruptible yet.
         # Kill any notes server that was started during cancellation too.
         llm.free_llm()
-        threads = (self.worker, self.notes_worker, self.align_worker,
-                   self.stats_poller, self.device_probe)
-        if any(thread is not None and thread.isRunning() for thread in threads):
-            event.ignore()
-            if not self._close_timer.isActive():
-                self._close_timer.start()
+        # A job is over once its finish handler has run, not when its thread
+        # stops: the last notes chunks can still be queued behind the thread.
+        if any(job is not None for job in (self.worker, self.notes_worker, self.align_worker)):
+            self._close_when_idle(event)
+            return
+        if not self._notes_settled:
+            self._close_timer.stop()
+            if not self._save_notes_text() and not self._settle_unsaved_notes():
+                self._call_off_close()
+                event.ignore()
+                return
+            self._notes_settled = True
+            self.stats_poller.stop()  # polled until now, in case the close was called off
+        if self.stats_poller.isRunning() or self.device_probe.isRunning():
+            self._close_when_idle(event)
             return
         self._close_timer.stop()
-        self._save_settings()  # include any final notes chunks queued during cancellation
         free_asr_models()
         event.accept()
+
+    def _close_when_idle(self, event) -> None:
+        """Not yet: the close timer calls close() again until it can go ahead."""
+        event.ignore()
+        if not self._close_timer.isActive():
+            self._close_timer.start()
+
+    def _settle_unsaved_notes(self) -> bool:
+        """The final save failed: True to close once the notes are written
+        after all, written elsewhere, or knowingly discarded."""
+        self._asking_about_notes = True
+        try:
+            while True:
+                choice = self._ask_about_unsaved_notes()
+                if choice == "retry" and self._save_notes_text():
+                    return True
+                if choice == "elsewhere" and self._write_notes_copy("Save notes elsewhere"):
+                    return True
+                if choice == "discard":
+                    return True
+                if choice == "return":
+                    return False
+        finally:
+            self._asking_about_notes = False
+
+    def _ask_about_unsaved_notes(self) -> str:
+        """One prompt: "retry", "elsewhere", "return" or "discard"."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Notes not saved")
+        choices = []
+        if self._notes_load_failed:
+            # Retrying cannot help: the unreadable file is never overwritten.
+            box.setText("The notes added since the app started have not been saved.")
+            box.setInformativeText(
+                f"{runtime.notes_path()} could not be read when the app started, so it "
+                f"is left as it was to protect it. Closing now would lose these notes.")
+        else:
+            box.setText("Your latest notes could not be saved.")
+            box.setInformativeText(
+                f"{self._notes_save_error}\n\nClosing now would lose them.")
+            choices.append((box.addButton("Retry", QMessageBox.ButtonRole.AcceptRole),
+                            "retry"))
+        choices.append((box.addButton("Save Elsewhere…", QMessageBox.ButtonRole.ActionRole),
+                        "elsewhere"))
+        back = box.addButton("Return to App", QMessageBox.ButtonRole.RejectRole)
+        choices.append((back, "return"))
+        choices.append((box.addButton("Close Without Saving",
+                                      QMessageBox.ButtonRole.DestructiveRole), "discard"))
+        box.setDefaultButton(choices[0][0])
+        box.setEscapeButton(back)
+        box.exec()
+        clicked = box.clickedButton()
+        box.deleteLater()
+        return next((choice for button, choice in choices if button is clicked), "return")
+
+    def _call_off_close(self) -> None:
+        """Back to the app with the notes still in the editor. The jobs have
+        finished, and their handlers reset the controls; stats still poll."""
+        self._closing = False
+        self.centralWidget().setEnabled(True)
+        self.statusBar().showMessage(
+            "Not closed: your notes are not saved yet. Export Notes… keeps a copy.")

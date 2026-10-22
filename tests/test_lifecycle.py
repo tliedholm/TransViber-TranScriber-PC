@@ -23,6 +23,7 @@ from PySide6.QtWidgets import QApplication, QDialog, QLineEdit
 import align
 import llm
 import main_window
+import runtime
 import transcriber
 from align import AUTOMATIC_REFERENCE, SESSION_REFERENCE, AlignmentResult, Suggestion
 from models import OffsetSource, Segment, Track
@@ -52,7 +53,9 @@ class _WindowTest(unittest.TestCase):
     def _dispose_window(self):
         """Close the window and delete it now. Left to the garbage collector,
         a MainWindow crashes PySide6 6.11 (an access violation partway through
-        some later test), though 6.12 collects it cleanly."""
+        some later test), though 6.12 collects it cleanly. Notes a test left
+        unsaved are let go rather than held on a prompt nobody will answer."""
+        self.window._ask_about_unsaved_notes = lambda: "discard"
         self.window.close()
         self.window.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
@@ -114,12 +117,17 @@ class WindowLifecycle(_WindowTest):
         worker.stop.assert_called_once()
         worker.wait.assert_not_called()
         self.assertTrue(self.window._close_timer.isActive())
+        # Stopped, but its finish signal is still queued: not over yet.
         worker.isRunning.return_value = False
+        stopped_event = QCloseEvent()
+        self.window.closeEvent(stopped_event)
+        self.assertFalse(stopped_event.isAccepted())
+        self.window._on_finished(True)
         final_event = QCloseEvent()
         self.window.closeEvent(final_event)
         self.assertTrue(final_event.isAccepted())
+        worker.stop.assert_called_once()
         self.assertFalse(self.window._close_timer.isActive())
-        self.window.worker = None
 
     def test_loading_saved_notes_does_not_schedule_a_rewrite(self):
         self.notes_path.write_text("Saved notes", encoding="utf-8")
@@ -127,18 +135,12 @@ class WindowLifecycle(_WindowTest):
         self.assertEqual(self.window.notes_edit.toPlainText(), "Saved notes")
         self.assertFalse(self.window._notes_save_timer.isActive())
 
-    def test_invalid_saved_notes_are_never_overwritten_on_close(self):
-        original = b"\xff\xfe\x00"
-        self.notes_path.write_bytes(original)
-        self.window._load_settings()
-        self.window._save_settings()
-        self.assertEqual(self.notes_path.read_bytes(), original)
-        self.assertTrue(self.window._notes_load_failed)
-
     def test_notes_save_error_is_visible(self):
+        self.window.notes_edit.setPlainText("Notes")
         with patch("main_window.runtime.write_atomic", side_effect=OSError("disk full")):
-            self.window._save_notes_text()
+            self.assertFalse(self.window._save_notes_text())
         self.assertIn("disk full", self.window.statusBar().currentMessage())
+        self.assertTrue(self.window._notes_dirty)
 
     def test_unavailable_gpu_selects_cpu(self):
         self.window._on_device_detected(False)
@@ -855,7 +857,7 @@ class Alignment(_WindowTest):
         self.assertEqual(data["segments"][0]["start"], 6.0)
 
     def test_close_waits_for_a_running_alignment(self):
-        worker = Mock()
+        worker = Mock(fingerprints={}, result=None)
         worker.isRunning.return_value = True
         self.window.align_worker = worker
         event = QCloseEvent()
@@ -863,10 +865,13 @@ class Alignment(_WindowTest):
         self.assertFalse(event.isAccepted())
         worker.stop.assert_called_once()
         worker.isRunning.return_value = False
+        stopped_event = QCloseEvent()
+        self.window.closeEvent(stopped_event)
+        self.assertFalse(stopped_event.isAccepted())   # its `finished` not yet handled
+        self.window._on_align_finished()
         final_event = QCloseEvent()
         self.window.closeEvent(final_event)
         self.assertTrue(final_event.isAccepted())
-        self.window.align_worker = None
 
 
 class WorkerLifecycle(unittest.TestCase):
@@ -951,3 +956,202 @@ class WorkerLifecycle(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _StreamingNotes(llm.NotesWorker):
+    """Streams a draft, then, once stopped, the cancelled marker: a real run's
+    last chunks, sent from its own thread."""
+
+    def run(self):
+        self.chunk.emit("Draft notes.")
+        deadline = time.monotonic() + 5.0
+        while not self._stop and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.cancelled = True
+        self.chunk.emit("\n\n*(cancelled)*")
+        self.completed.emit()
+
+
+class NotesOnClose(_WindowTest):
+    """A close never loses notes it could not write: it waits for the last of
+    them, and a failed save asks once instead of closing."""
+
+    def setUp(self):
+        super().setUp()
+        self.notes_path.write_text("Old notes", encoding="utf-8")
+        self.real_prompt = main_window.MainWindow._ask_about_unsaved_notes
+        self.prompt = self._patch("main_window.MainWindow._ask_about_unsaved_notes",
+                                  return_value="return")
+        self._patch("main_window.llm.free_llm")
+
+    def disk_full(self):
+        return patch("main_window.runtime.write_atomic", side_effect=OSError("disk full"))
+
+    def close(self):
+        event = QCloseEvent()
+        self.window.closeEvent(event)
+        return event.isAccepted()
+
+    def start_notes(self):
+        """AI Notes running on a transcript, streaming from its own thread."""
+        w = self.window
+        w.tracks = [Track(Path("bob.wav"), "Bob",
+                          segments=[Segment("Bob", 1.0, 2.0, "Hello there.")])]
+        with patch("main_window.llm.NotesWorker", _StreamingNotes):
+            w.toggle_ai_notes()
+        _wait_until(lambda: "Draft notes." in w.notes_edit.toPlainText())
+
+    def test_a_failed_final_save_keeps_the_window_and_the_notes(self):
+        w = self.window
+        w.notes_edit.setPlainText("Unsaved notes")
+        with self.disk_full():
+            self.assertFalse(self.close())
+        self.prompt.assert_called_once()
+        self.assertIn("disk full", w._notes_save_error)
+        self.assertEqual(w.notes_edit.toPlainText(), "Unsaved notes")
+        self.assertTrue(w._notes_dirty)
+        self.assertEqual(self.notes_path.read_text(encoding="utf-8"), "Old notes")
+
+    def test_retry_writes_the_notes_then_closes(self):
+        w = self.window
+        w.notes_edit.setPlainText("Unsaved notes")
+        real_write = runtime.write_atomic
+        full = [True]
+
+        def write(path, text):
+            if full[0]:
+                raise OSError("disk full")
+            real_write(path, text)
+
+        def prompt():
+            full[0] = self.prompt.call_count < 2    # space is freed before the second retry
+            return "retry"
+        self.prompt.side_effect = prompt
+        with patch("main_window.runtime.write_atomic", side_effect=write):
+            self.assertTrue(self.close())
+        self.assertEqual(self.prompt.call_count, 2)   # a retry that fails asks again
+        self.assertEqual(self.notes_path.read_text(encoding="utf-8"), "Unsaved notes")
+        self.assertFalse(w._notes_dirty)
+
+    def test_closing_without_saving_is_the_users_choice(self):
+        self.window.notes_edit.setPlainText("Unsaved notes")
+        self.prompt.return_value = "discard"
+        with self.disk_full():
+            self.assertTrue(self.close())
+        self.assertEqual(self.notes_path.read_text(encoding="utf-8"), "Old notes")
+
+    def test_invalid_saved_notes_are_never_overwritten_on_close(self):
+        original = b"\xff\xfe\x00"
+        self.notes_path.write_bytes(original)
+        self.window._load_settings()
+        self.assertTrue(self.close())    # untouched: nothing to ask about
+        self.assertEqual(self.notes_path.read_bytes(), original)
+        self.assertTrue(self.window._notes_load_failed)
+        self.prompt.assert_not_called()
+
+    def test_untouched_notes_close_without_a_write(self):
+        self.window._load_settings()
+        with patch("main_window.runtime.write_atomic") as write:
+            self.assertTrue(self.close())
+        write.assert_not_called()
+        self.prompt.assert_not_called()
+
+    def test_the_last_notes_queued_behind_a_stopped_run_are_saved(self):
+        w = self.window
+        self.start_notes()
+        self.assertFalse(self.close())
+        self.assertTrue(w.notes_worker.wait(5000))
+        # The thread is over; its last chunk and `completed` are still queued.
+        self.assertFalse(self.close())
+        self.assertNotIn("*(cancelled)*", w.notes_edit.toPlainText())
+        _wait_until(lambda: w._notes_settled)    # delivered, then the close timer closes
+        self.assertFalse(w._notes_save_timer.isActive())   # the close saved them itself
+        saved = self.notes_path.read_text(encoding="utf-8")
+        self.assertIn("Draft notes.", saved)
+        self.assertTrue(saved.endswith("*(cancelled)*"))
+        self.prompt.assert_not_called()
+
+    def test_return_to_app_puts_everything_back(self):
+        w = self.window
+        w.stats_poller.stop = Mock()
+        self.start_notes()
+        with self.disk_full():
+            w.close()
+            _wait_until(lambda: self.prompt.called and not w._closing)
+        self.assertTrue(w.centralWidget().isEnabled())
+        self.assertFalse(w._close_timer.isActive())
+        w.stats_poller.stop.assert_not_called()       # still polling
+        self.assertEqual(w.btn_ai_notes.text(), "AI Notes")
+        self.assertTrue(w.btn_ai_notes.isEnabled())
+        self.assertTrue(w.btn_transcribe.isEnabled())
+        self.assertTrue(w.combo_notes_model.isEnabled())
+        self.assertFalse(w._notes_elapsed_timer.isActive())
+        self.assertIn("*(cancelled)*", w.notes_edit.toPlainText())
+        self.assertIn("not saved", w.statusBar().currentMessage())
+        w.notes_edit.appendPlainText("More.")
+        self.assertTrue(w._notes_save_timer.isActive())   # autosave is back
+        # And the next close, with room on the disk again, saves and goes.
+        self.assertTrue(self.close())
+        w.stats_poller.stop.assert_called_once()
+        self.assertTrue(self.notes_path.read_text(encoding="utf-8").endswith("More."))
+        self.prompt.assert_called_once()
+
+    def test_one_prompt_however_often_close_is_asked_again(self):
+        w = self.window
+        self.start_notes()
+
+        def prompt():
+            self.assertFalse(self.close())   # another click, under the prompt
+            QTest.qWait(300)                 # and the close timer's ticks, were it running
+            return "return"
+        self.prompt.side_effect = prompt
+        with self.disk_full():
+            w.close()
+            _wait_until(lambda: self.prompt.called and not w._closing)
+            QTest.qWait(300)
+        self.prompt.assert_called_once()
+
+    def test_notes_added_after_an_unreadable_load_are_saved_elsewhere(self):
+        w = self.window
+        original = b"\xff\xfe\x00"
+        self.notes_path.write_bytes(original)
+        w._load_settings()
+        w.notes_edit.appendPlainText("Typed since.")
+        target = Path(self.temp.name) / "rescued.md"
+        self.prompt.return_value = "elsewhere"
+        answers = [("", ""), (str(target), "Markdown (*.md)")]    # cancelled, then a file
+        with patch("main_window.QFileDialog.getSaveFileName", side_effect=answers):
+            self.assertTrue(self.close())
+        self.assertEqual(self.prompt.call_count, 2)
+        self.assertEqual(self.notes_path.read_bytes(), original)
+        self.assertIn("Typed since.", target.read_text(encoding="utf-8"))
+
+    def answer(self, button):
+        """Open the real prompt and press `button` (a label, or Escape).
+        Returns the choice and the buttons it offered."""
+        offered = []
+
+        def press():
+            box = QApplication.activeModalWidget()
+            offered.extend(b.text() for b in box.buttons())
+            if button == "Escape":
+                QTest.keyClick(box, Qt.Key.Key_Escape)
+            else:
+                next(b for b in box.buttons() if b.text() == button).click()
+        QTimer.singleShot(0, press)
+        return self.real_prompt(self.window), offered
+
+    def test_the_prompt_buttons(self):
+        self.window._notes_save_error = "disk full"
+        for button, choice in (("Retry", "retry"), ("Save Elsewhere…", "elsewhere"),
+                               ("Return to App", "return"),
+                               ("Close Without Saving", "discard"), ("Escape", "return")):
+            with self.subTest(button=button):
+                answered, offered = self.answer(button)
+                self.assertEqual(answered, choice)
+                self.assertEqual(offered[0], "Retry")
+        # A file it would never overwrite: retrying cannot help, so it isn't offered.
+        self.window._notes_load_failed = True
+        answered, offered = self.answer("Return to App")
+        self.assertEqual(answered, "return")
+        self.assertNotIn("Retry", offered)
