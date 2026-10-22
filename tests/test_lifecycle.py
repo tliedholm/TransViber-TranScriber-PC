@@ -25,7 +25,7 @@ import llm
 import main_window
 import transcriber
 from align import AUTOMATIC_REFERENCE, SESSION_REFERENCE, AlignmentResult, Suggestion
-from models import OffsetSource, Segment, Track
+from models import OffsetSource, Segment, Track, TrackStatus
 from stats import StatsPoller
 
 _app = QApplication.instance() or QApplication([])
@@ -867,6 +867,131 @@ class Alignment(_WindowTest):
         self.window.closeEvent(final_event)
         self.assertTrue(final_event.isAccepted())
         self.window.align_worker = None
+
+
+class IncompleteExport(_WindowTest):
+    """Export warns about every track that isn't fully transcribed, including
+    the ones that produced nothing at all."""
+
+    def setUp(self):
+        super().setUp()
+        self.folder = Path(self.temp.name)
+        self.warning = self._patch("main_window.QMessageBox.warning",
+                                   return_value=main_window.QMessageBox.StandardButton.Cancel)
+        self.save_dialog = self._patch("main_window.QFileDialog.getSaveFileName",
+                                       return_value=("", ""))
+        self.add(Track(Path("alice.wav"), "Alice", status=TrackStatus.DONE,
+                       segments=[Segment("Alice", 1.0, 2.0, "Hello there.")]))
+
+    def warned_about(self):
+        """The warning's text, or None if export went straight to the dialog."""
+        if not self.warning.called:
+            return None
+        return self.warning.call_args.args[2]
+
+    def test_a_track_with_no_transcript_is_warned_about(self):
+        cases = [
+            (TrackStatus.ERROR, "failed — nothing transcribed"),
+            (TrackStatus.CANCELLED, "cancelled — nothing transcribed"),
+            (TrackStatus.PENDING, "not transcribed"),
+        ]
+        for status, described in cases:
+            with self.subTest(status=status):
+                self.warning.reset_mock()
+                self.save_dialog.reset_mock()
+                del self.window.tracks[1:]
+                self.window.tracks.append(Track(Path("bob.wav"), "Bob", status=status))
+                self.window.export_dialog()
+                self.assertIn(f"bob.wav — {described}", self.warned_about())
+                self.assertNotIn("alice.wav", self.warned_about())
+                self.save_dialog.assert_not_called()   # Cancel is the default
+
+    def test_a_partial_track_is_still_warned_about(self):
+        self.add(Track(Path("bob.wav"), "Bob", status=TrackStatus.ERROR,
+                       segments=[Segment("Bob", 3.0, 4.0, "And then—")]))
+        self.window.export_dialog()
+        self.assertIn("bob.wav — failed partway — partial transcript", self.warned_about())
+
+    def test_a_finished_silent_track_is_not_a_gap(self):
+        self.add(Track(Path("bob.wav"), "Bob", status=TrackStatus.DONE))
+        self.window.export_dialog()
+        self.assertIsNone(self.warned_about())
+        self.save_dialog.assert_called_once()
+
+    def test_a_long_list_is_counted_in_full(self):
+        self.add(*(Track(Path(f"guest{n}.wav"), f"Guest {n}") for n in range(7)))
+        self.window.export_dialog()
+        text = self.warned_about()
+        self.assertIn("7 track(s) not fully transcribed", text)
+        self.assertIn("guest4.wav", text)
+        self.assertNotIn("guest5.wav", text)
+        self.assertIn("…and 2 more", text)
+
+    def test_continuing_exports_what_there_is_and_every_tracks_status(self):
+        self.warning.return_value = main_window.QMessageBox.StandardButton.Yes
+        self.add(Track(Path("bob.wav"), "Bob", status=TrackStatus.ERROR,
+                       error="CUDA out of memory"))
+        target = self.folder / "out.json"
+        self.save_dialog.return_value = (str(target), "JSON (*.json)")
+        self.window.export_dialog()
+        data = json.loads(target.read_text(encoding="utf-8"))
+        self.assertEqual([(t["speaker"], t["status"], t["error"]) for t in data["tracks"]],
+                         [("Alice", "Done", ""), ("Bob", "Error", "CUDA out of memory")])
+        self.assertEqual([s["text"] for s in data["segments"]], ["Hello there."])
+
+
+class ExportFailures(_WindowTest):
+    """A write that fails partway is reported as far as it got."""
+
+    def setUp(self):
+        super().setUp()
+        self.folder = Path(self.temp.name)
+        self.critical = self._patch("main_window.QMessageBox.critical")
+        self.add(Track(Path("alice.wav"), "Alice", status=TrackStatus.DONE,
+                       segments=[Segment("Alice", 1.0, 2.0, "Hello there.")]))
+
+    def replace_failing_on(self, call):
+        real = os.replace
+        calls = []
+
+        def replace(source, target):
+            calls.append(target)
+            if len(calls) == call:
+                raise PermissionError(13, "Access is denied")
+            return real(source, target)
+        return patch("exporters.os.replace", side_effect=replace)
+
+    def test_a_partial_all_formats_export_names_what_was_written(self):
+        all_formats = main_window.EXPORT_FILTERS.split(";;")[-1]
+        self._patch("main_window.QFileDialog.getSaveFileName",
+                    return_value=(str(self.folder / "out.md"), all_formats))
+        with self.replace_failing_on(2):
+            self.window.export_dialog()
+        title, message = self.critical.call_args.args[1:3]
+        self.assertEqual(title, "Export incomplete")
+        self.assertIn("Exported out.md, but could not write out.txt", message)
+        self.assertEqual(self.window.statusBar().currentMessage(), "Partly exported: out.md")
+
+    def test_a_failed_single_export_says_nothing_was_written(self):
+        self._patch("main_window.QFileDialog.getSaveFileName",
+                    return_value=(str(self.folder / "out.srt"), "SubRip subtitles (*.srt)"))
+        with self.replace_failing_on(1):
+            self.window.export_dialog()
+        title, message = self.critical.call_args.args[1:3]
+        self.assertEqual(title, "Export failed")
+        self.assertIn("Nothing was exported", message)
+        self.assertEqual(list(self.folder.glob("out*")), [])
+
+    def test_a_failed_notes_export_keeps_the_earlier_file(self):
+        target = self.folder / "notes-export.md"
+        target.write_text("Last week's notes", encoding="utf-8")
+        self.window.notes_edit.setPlainText("This week's notes")
+        self._patch("main_window.QFileDialog.getSaveFileName",
+                    return_value=(str(target), "Markdown (*.md)"))
+        with self.replace_failing_on(1):
+            self.window.export_notes_dialog()
+        self.assertEqual(self.critical.call_args.args[1], "Export failed")
+        self.assertEqual(target.read_text(encoding="utf-8"), "Last week's notes")
 
 
 class WorkerLifecycle(unittest.TestCase):

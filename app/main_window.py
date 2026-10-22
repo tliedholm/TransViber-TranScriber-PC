@@ -140,6 +140,25 @@ def _canonical(path: Path) -> str:
     return os.path.normcase(str(resolved))
 
 
+def _missing_from_export(track: Track) -> str | None:
+    """How much of a track's speech an export would leave out, or None.
+
+    A finished track with no segments is silent audio, not a gap, so only
+    the status decides: a track that stopped before its first segment, or
+    never started, is missing from the transcript as surely as a partial
+    one is missing its tail.
+    """
+    if track.status is TrackStatus.DONE:
+        return None
+    if track.status is TrackStatus.PENDING:
+        return "not transcribed"
+    if track.status is TrackStatus.TRANSCRIBING:
+        return "still transcribing"
+    stopped = "failed" if track.status is TrackStatus.ERROR else "cancelled"
+    return (f"{stopped} partway — partial transcript" if track.segments
+            else f"{stopped} — nothing transcribed")
+
+
 def _add_grouped_models(combo: QComboBox,
                         groups: list[tuple[str, list[str]]]) -> None:
     """Populate a combo with bold, non-selectable tier headings."""
@@ -1431,26 +1450,27 @@ class MainWindow(QMainWindow):
     # ---------- Export ----------
 
     def _confirm_incomplete_export(self) -> bool:
-        """Warn before exporting when a track stopped early.
+        """Warn before exporting when any track isn't fully transcribed.
 
         A failed or cancelled track keeps the segments it produced before it
         stopped, so the transcript can look finished while missing the tail
-        of one speaker. Nothing else in the output says so.
+        of one speaker — or all of them, when it stopped before its first
+        segment or never started. Only JSON records track status; the other
+        formats would leave that speaker out without a trace.
         """
-        incomplete = [t for t in self.tracks
-                      if t.status in (TrackStatus.ERROR, TrackStatus.CANCELLED)
-                      and t.segments]
+        incomplete = [(t, gap) for t in self.tracks
+                      if (gap := _missing_from_export(t)) is not None]
         if not incomplete:
             return True
-        listed = "\n".join(f"  • {t.source_label} — {t.status.value.lower()}"
-                           for t in incomplete[:5])
+        listed = "\n".join(f"  • {t.source_label} — {gap}"
+                           for t, gap in incomplete[:5])
         if len(incomplete) > 5:
             listed += f"\n  • …and {len(incomplete) - 5} more"
         answer = QMessageBox.warning(
             self, "Incomplete transcript",
-            f"{len(incomplete)} track(s) stopped before finishing:\n\n{listed}\n\n"
-            "Their transcripts are partial — the rest of what those speakers "
-            "said is missing. Export anyway?",
+            f"{len(incomplete)} track(s) not fully transcribed:\n\n{listed}\n\n"
+            "Whatever those speakers said that wasn't transcribed will be "
+            "missing from the export. Export anyway?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         )
@@ -1514,6 +1534,13 @@ class MainWindow(QMainWindow):
                 segments = merge_tracks(self.tracks)
                 exporters.export(path, segments, self.tracks, model_name)
                 self.statusBar().showMessage(f"Exported {path}")
+        except exporters.ExportError as exc:
+            # Some formats can be new and the rest old: say so, not just "failed".
+            if exc.written:
+                self.statusBar().showMessage(
+                    "Partly exported: " + ", ".join(p.name for p in exc.written))
+            QMessageBox.critical(
+                self, "Export incomplete" if exc.written else "Export failed", str(exc))
         except OSError as exc:
             QMessageBox.critical(self, "Export failed", str(exc))
 
@@ -1633,7 +1660,7 @@ class MainWindow(QMainWindow):
         if not path_str:
             return
         try:
-            Path(path_str).write_text(text, encoding="utf-8")
+            exporters.write_file(Path(path_str), text)
             self.statusBar().showMessage(f"Notes exported to {path_str}")
         except OSError as exc:
             QMessageBox.critical(self, "Export failed", str(exc))
