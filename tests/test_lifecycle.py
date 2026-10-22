@@ -26,7 +26,7 @@ import main_window
 import runtime
 import transcriber
 from align import AUTOMATIC_REFERENCE, SESSION_REFERENCE, AlignmentResult, Suggestion
-from models import OffsetSource, Segment, Track
+from models import OffsetSource, Segment, Track, TrackStatus
 from stats import StatsPoller
 
 _app = QApplication.instance() or QApplication([])
@@ -154,6 +154,68 @@ class WindowLifecycle(_WindowTest):
         item.setToolTip("old GPU error")
         self.window._set_status(0, "Pending")
         self.assertEqual(item.toolTip(), "")
+
+
+class LanguageChoices(_WindowTest):
+    """Languages the chosen model can't take: greyed out, and flagged and
+    refused when one is already selected, never quietly turned into
+    auto-detect."""
+
+    def language_row(self, code):
+        return self.window.combo_lang.findData(code)
+
+    def item(self, code):
+        return self.window.combo_lang.model().item(self.language_row(code))
+
+    def test_qwen_greys_out_what_it_lacks_and_whisper_gets_it_back(self):
+        w = self.window
+        w.combo_model.setCurrentText("qwen3-asr-1.7b")
+        self.assertFalse(self.item("no").isEnabled())
+        self.assertFalse(self.item("uk").isEnabled())
+        self.assertTrue(self.item("en").isEnabled())
+        self.assertTrue(self.item(None).isEnabled())
+        w.combo_model.setCurrentText("large-v3")
+        self.assertTrue(self.item("no").isEnabled())
+        self.assertTrue(self.item("uk").isEnabled())
+
+    def test_a_typed_qwen_repo_gets_the_same_choices(self):
+        self.window.combo_model.setCurrentText("Qwen/Qwen3-ASR-0.6B")
+        self.assertFalse(self.item("no").isEnabled())
+
+    def test_switching_to_qwen_keeps_the_language_and_flags_it(self):
+        w = self.window
+        w.combo_model.setCurrentText("large-v3")
+        w.combo_lang.setCurrentIndex(self.language_row("no"))
+        self.assertTrue(w.label_lang_conflict.isHidden())
+        w.combo_model.setCurrentText("qwen3-asr-1.7b")
+        self.assertEqual(w.combo_lang.currentData(), "no")
+        self.assertFalse(w.label_lang_conflict.isHidden())
+        self.assertIn("Norwegian", w.label_lang_conflict.toolTip())
+        w.combo_lang.setCurrentIndex(self.language_row("en"))
+        self.assertTrue(w.label_lang_conflict.isHidden())
+
+    def test_transcribe_refuses_the_conflict_and_changes_nothing(self):
+        w = self.window
+        self.add(Track(Path("alice.wav"), "Alice"))
+        w.combo_model.setCurrentText("qwen3-asr-1.7b")
+        w.combo_lang.setCurrentIndex(self.language_row("uk"))
+        status = w.table.item(0, main_window.COL_STATUS).text()
+        with patch("main_window.TranscribeWorker") as worker_class, \
+                patch("main_window.QMessageBox.warning") as warning, \
+                patch("main_window.llm.free_llm") as free_llm:
+            w.toggle_transcription()
+        worker_class.assert_not_called()
+        free_llm.assert_not_called()
+        self.assertIn("Ukrainian", warning.call_args.args[2])
+        self.assertIsNone(w.worker)
+        self.assertEqual(w.table.item(0, main_window.COL_STATUS).text(), status)
+
+    def test_a_saved_conflict_is_flagged_at_startup(self):
+        self.settings.setValue("model", "qwen3-asr-0.6b")
+        self.settings.setValue("language", "no")
+        self.window._load_settings()
+        self.assertEqual(self.window.combo_lang.currentData(), "no")
+        self.assertFalse(self.window.label_lang_conflict.isHidden())
 
 
 class OffsetColumn(_WindowTest):
@@ -874,6 +936,131 @@ class Alignment(_WindowTest):
         self.assertTrue(final_event.isAccepted())
 
 
+class IncompleteExport(_WindowTest):
+    """Export warns about every track that isn't fully transcribed, including
+    the ones that produced nothing at all."""
+
+    def setUp(self):
+        super().setUp()
+        self.folder = Path(self.temp.name)
+        self.warning = self._patch("main_window.QMessageBox.warning",
+                                   return_value=main_window.QMessageBox.StandardButton.Cancel)
+        self.save_dialog = self._patch("main_window.QFileDialog.getSaveFileName",
+                                       return_value=("", ""))
+        self.add(Track(Path("alice.wav"), "Alice", status=TrackStatus.DONE,
+                       segments=[Segment("Alice", 1.0, 2.0, "Hello there.")]))
+
+    def warned_about(self):
+        """The warning's text, or None if export went straight to the dialog."""
+        if not self.warning.called:
+            return None
+        return self.warning.call_args.args[2]
+
+    def test_a_track_with_no_transcript_is_warned_about(self):
+        cases = [
+            (TrackStatus.ERROR, "failed — nothing transcribed"),
+            (TrackStatus.CANCELLED, "cancelled — nothing transcribed"),
+            (TrackStatus.PENDING, "not transcribed"),
+        ]
+        for status, described in cases:
+            with self.subTest(status=status):
+                self.warning.reset_mock()
+                self.save_dialog.reset_mock()
+                del self.window.tracks[1:]
+                self.window.tracks.append(Track(Path("bob.wav"), "Bob", status=status))
+                self.window.export_dialog()
+                self.assertIn(f"bob.wav — {described}", self.warned_about())
+                self.assertNotIn("alice.wav", self.warned_about())
+                self.save_dialog.assert_not_called()   # Cancel is the default
+
+    def test_a_partial_track_is_still_warned_about(self):
+        self.add(Track(Path("bob.wav"), "Bob", status=TrackStatus.ERROR,
+                       segments=[Segment("Bob", 3.0, 4.0, "And then—")]))
+        self.window.export_dialog()
+        self.assertIn("bob.wav — failed partway — partial transcript", self.warned_about())
+
+    def test_a_finished_silent_track_is_not_a_gap(self):
+        self.add(Track(Path("bob.wav"), "Bob", status=TrackStatus.DONE))
+        self.window.export_dialog()
+        self.assertIsNone(self.warned_about())
+        self.save_dialog.assert_called_once()
+
+    def test_a_long_list_is_counted_in_full(self):
+        self.add(*(Track(Path(f"guest{n}.wav"), f"Guest {n}") for n in range(7)))
+        self.window.export_dialog()
+        text = self.warned_about()
+        self.assertIn("7 track(s) not fully transcribed", text)
+        self.assertIn("guest4.wav", text)
+        self.assertNotIn("guest5.wav", text)
+        self.assertIn("…and 2 more", text)
+
+    def test_continuing_exports_what_there_is_and_every_tracks_status(self):
+        self.warning.return_value = main_window.QMessageBox.StandardButton.Yes
+        self.add(Track(Path("bob.wav"), "Bob", status=TrackStatus.ERROR,
+                       error="CUDA out of memory"))
+        target = self.folder / "out.json"
+        self.save_dialog.return_value = (str(target), "JSON (*.json)")
+        self.window.export_dialog()
+        data = json.loads(target.read_text(encoding="utf-8"))
+        self.assertEqual([(t["speaker"], t["status"], t["error"]) for t in data["tracks"]],
+                         [("Alice", "Done", ""), ("Bob", "Error", "CUDA out of memory")])
+        self.assertEqual([s["text"] for s in data["segments"]], ["Hello there."])
+
+
+class ExportFailures(_WindowTest):
+    """A write that fails partway is reported as far as it got."""
+
+    def setUp(self):
+        super().setUp()
+        self.folder = Path(self.temp.name)
+        self.critical = self._patch("main_window.QMessageBox.critical")
+        self.add(Track(Path("alice.wav"), "Alice", status=TrackStatus.DONE,
+                       segments=[Segment("Alice", 1.0, 2.0, "Hello there.")]))
+
+    def replace_failing_on(self, call):
+        real = os.replace
+        calls = []
+
+        def replace(source, target):
+            calls.append(target)
+            if len(calls) == call:
+                raise PermissionError(13, "Access is denied")
+            return real(source, target)
+        return patch("exporters.os.replace", side_effect=replace)
+
+    def test_a_partial_all_formats_export_names_what_was_written(self):
+        all_formats = main_window.EXPORT_FILTERS.split(";;")[-1]
+        self._patch("main_window.QFileDialog.getSaveFileName",
+                    return_value=(str(self.folder / "out.md"), all_formats))
+        with self.replace_failing_on(2):
+            self.window.export_dialog()
+        title, message = self.critical.call_args.args[1:3]
+        self.assertEqual(title, "Export incomplete")
+        self.assertIn("Exported out.md, but could not write out.txt", message)
+        self.assertEqual(self.window.statusBar().currentMessage(), "Partly exported: out.md")
+
+    def test_a_failed_single_export_says_nothing_was_written(self):
+        self._patch("main_window.QFileDialog.getSaveFileName",
+                    return_value=(str(self.folder / "out.srt"), "SubRip subtitles (*.srt)"))
+        with self.replace_failing_on(1):
+            self.window.export_dialog()
+        title, message = self.critical.call_args.args[1:3]
+        self.assertEqual(title, "Export failed")
+        self.assertIn("Nothing was exported", message)
+        self.assertEqual(list(self.folder.glob("out*")), [])
+
+    def test_a_failed_notes_export_keeps_the_earlier_file(self):
+        target = self.folder / "notes-export.md"
+        target.write_text("Last week's notes", encoding="utf-8")
+        self.window.notes_edit.setPlainText("This week's notes")
+        self._patch("main_window.QFileDialog.getSaveFileName",
+                    return_value=(str(target), "Markdown (*.md)"))
+        with self.replace_failing_on(1):
+            self.window.export_notes_dialog()
+        self.assertEqual(self.critical.call_args.args[1], "Export failed")
+        self.assertEqual(target.read_text(encoding="utf-8"), "Last week's notes")
+
+
 class WorkerLifecycle(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "win32", "Windows windowed launcher")
     def test_pythonw_source_launch_records_startup_errors_and_timings(self):
@@ -920,6 +1107,19 @@ class WorkerLifecycle(unittest.TestCase):
         with patch.object(worker, "_load_model") as load:
             worker.run()
             load.assert_not_called()
+
+    def test_a_language_the_model_lacks_fails_before_loading_or_retrying(self):
+        worker = transcriber.TranscribeWorker([], [0, 1], "qwen3-asr-1.7b", "cuda", "no")
+        failures, finished = [], []
+        worker.track_failed.connect(lambda i, message: failures.append((i, message)))
+        worker.finished_all.connect(finished.append)
+        with patch("transcriber._get_model") as load:
+            worker.run()
+            load.assert_not_called()
+        self.assertEqual([i for i, _ in failures], [0, 1])
+        self.assertIn("can't transcribe", failures[0][1])
+        self.assertEqual(finished, [False])
+        self.assertEqual(worker.device, "cuda")  # no CPU retry was attempted
 
     def test_cancelled_notes_does_not_download_or_spawn_a_server(self):
         worker = llm.NotesWorker("Alice: hello")

@@ -63,6 +63,7 @@ from transcriber import (
     TranscribeWorker,
     engine_for,
     free_asr_models,
+    language_supported,
 )
 
 # Grouped by the user's preferred quality/speed tiers.
@@ -138,6 +139,25 @@ def _canonical(path: Path) -> str:
     except OSError:
         resolved = path.absolute()
     return os.path.normcase(str(resolved))
+
+
+def _missing_from_export(track: Track) -> str | None:
+    """How much of a track's speech an export would leave out, or None.
+
+    A finished track with no segments is silent audio, not a gap, so only
+    the status decides: a track that stopped before its first segment, or
+    never started, is missing from the transcript as surely as a partial
+    one is missing its tail.
+    """
+    if track.status is TrackStatus.DONE:
+        return None
+    if track.status is TrackStatus.PENDING:
+        return "not transcribed"
+    if track.status is TrackStatus.TRANSCRIBING:
+        return "still transcribing"
+    stopped = "failed" if track.status is TrackStatus.ERROR else "cancelled"
+    return (f"{stopped} partway — partial transcript" if track.segments
+            else f"{stopped} — nothing transcribed")
 
 
 def _add_grouped_models(combo: QComboBox,
@@ -510,8 +530,8 @@ class MainWindow(QMainWindow):
             "benchmarks. All CC-BY-4.0. None of those rankings has been\n"
             "measured on recordings like yours.\n"
             "\n"
-            "The Language setting applies to Whisper and Qwen. NVIDIA models\n"
-            "ignore it and auto-detect."
+            "The Language setting applies to Whisper and Qwen (Qwen has no\n"
+            "Norwegian or Ukrainian). NVIDIA models ignore it and auto-detect."
         )
         bar.addWidget(self.combo_model)
         bar.addWidget(self._make_star_button(self.combo_model, "starred_model"))
@@ -521,6 +541,12 @@ class MainWindow(QMainWindow):
         for name, code in LANGUAGES:
             self.combo_lang.addItem(name, code)
         bar.addWidget(self.combo_lang)
+        # Shown while the chosen language is one the model can't take.
+        self.label_lang_conflict = QLabel("⚠ Not supported by this model")
+        self.label_lang_conflict.hide()
+        bar.addWidget(self.label_lang_conflict)
+        self.combo_model.currentTextChanged.connect(self._update_language_choices)
+        self.combo_lang.currentIndexChanged.connect(self._update_language_choices)
 
         bar.addWidget(QLabel("Device:"))
         self.combo_device = QComboBox()
@@ -853,6 +879,32 @@ class MainWindow(QMainWindow):
     def _update_hints_visibility(self) -> None:
         model = self.combo_model.currentText().strip()
         self.hints_widget.setVisible(engine_for(model) in ("whisper", "qwen"))
+
+    def _update_language_choices(self) -> None:
+        """Grey out the languages the chosen model can't take.
+
+        One that is already selected stays selected and is flagged, rather
+        than quietly becoming Auto-detect, which would change what was asked
+        for; Transcribe refuses it until the language or model changes.
+        """
+        model = self.combo_model.currentText().strip()
+        items = self.combo_lang.model()
+        for row in range(self.combo_lang.count()):
+            supported = language_supported(model, self.combo_lang.itemData(row))
+            items.item(row).setEnabled(supported)
+            items.item(row).setToolTip("" if supported else f"Not supported by {model}.")
+        conflict = self._language_conflict()
+        self.label_lang_conflict.setToolTip(conflict or "")
+        self.label_lang_conflict.setVisible(conflict is not None)
+
+    def _language_conflict(self) -> str | None:
+        """Why the chosen model can't take the chosen language, or None."""
+        model = self.combo_model.currentText().strip()
+        if language_supported(model, self.combo_lang.currentData()):
+            return None
+        language = self.combo_lang.currentText()
+        return (f"{model} can't transcribe {language}. Choose another language "
+                f"or Auto-detect, or a Whisper model for {language}.")
 
     def _hotwords_text(self) -> str:
         """Collapse the multi-line hints panel into one comma-separated string.
@@ -1298,6 +1350,10 @@ class MainWindow(QMainWindow):
         if not indices:
             QMessageBox.information(self, "No tracks", "Add at least one audio track first.")
             return
+        conflict = self._language_conflict()
+        if conflict is not None:
+            QMessageBox.warning(self, "Language not supported", conflict)
+            return
 
         for i in indices:
             track = self.tracks[i]
@@ -1439,26 +1495,27 @@ class MainWindow(QMainWindow):
     # ---------- Export ----------
 
     def _confirm_incomplete_export(self) -> bool:
-        """Warn before exporting when a track stopped early.
+        """Warn before exporting when any track isn't fully transcribed.
 
         A failed or cancelled track keeps the segments it produced before it
         stopped, so the transcript can look finished while missing the tail
-        of one speaker. Nothing else in the output says so.
+        of one speaker — or all of them, when it stopped before its first
+        segment or never started. Only JSON records track status; the other
+        formats would leave that speaker out without a trace.
         """
-        incomplete = [t for t in self.tracks
-                      if t.status in (TrackStatus.ERROR, TrackStatus.CANCELLED)
-                      and t.segments]
+        incomplete = [(t, gap) for t in self.tracks
+                      if (gap := _missing_from_export(t)) is not None]
         if not incomplete:
             return True
-        listed = "\n".join(f"  • {t.source_label} — {t.status.value.lower()}"
-                           for t in incomplete[:5])
+        listed = "\n".join(f"  • {t.source_label} — {gap}"
+                           for t, gap in incomplete[:5])
         if len(incomplete) > 5:
             listed += f"\n  • …and {len(incomplete) - 5} more"
         answer = QMessageBox.warning(
             self, "Incomplete transcript",
-            f"{len(incomplete)} track(s) stopped before finishing:\n\n{listed}\n\n"
-            "Their transcripts are partial — the rest of what those speakers "
-            "said is missing. Export anyway?",
+            f"{len(incomplete)} track(s) not fully transcribed:\n\n{listed}\n\n"
+            "Whatever those speakers said that wasn't transcribed will be "
+            "missing from the export. Export anyway?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         )
@@ -1522,6 +1579,13 @@ class MainWindow(QMainWindow):
                 segments = merge_tracks(self.tracks)
                 exporters.export(path, segments, self.tracks, model_name)
                 self.statusBar().showMessage(f"Exported {path}")
+        except exporters.ExportError as exc:
+            # Some formats can be new and the rest old: say so, not just "failed".
+            if exc.written:
+                self.statusBar().showMessage(
+                    "Partly exported: " + ", ".join(p.name for p in exc.written))
+            QMessageBox.critical(
+                self, "Export incomplete" if exc.written else "Export failed", str(exc))
         except OSError as exc:
             QMessageBox.critical(self, "Export failed", str(exc))
 
@@ -1644,7 +1708,7 @@ class MainWindow(QMainWindow):
         if not path_str:
             return False
         try:
-            Path(path_str).write_text(self.notes_edit.toPlainText(), encoding="utf-8")
+            exporters.write_file(Path(path_str), self.notes_edit.toPlainText())
         except OSError as exc:
             QMessageBox.critical(self, "Export failed", str(exc))
             return False
@@ -1738,6 +1802,7 @@ class MainWindow(QMainWindow):
             self.check_dark.setChecked(dark)
             self._set_dark_mode(dark)
         self._update_hints_visibility()
+        self._update_language_choices()
 
     def _save_settings(self) -> None:
         # The notes themselves are a file, not a registry value, saved on

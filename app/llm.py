@@ -366,13 +366,18 @@ REASONING_EXTRA_TOKENS = 1500
 # built here is verified against /tokenize before it is sent.
 CHARS_PER_TOKEN = 3.5
 
-# Held back inside MAX_INPUT_TOKENS for what /tokenize doesn't see: the chat
-# template's role headers and control tokens wrapped around the prompt.
+# Stands in for what /tokenize doesn't see — the chat template's role
+# headers and control tokens, and the system message — but only when the
+# server can't count the rendered request itself. Normally it can, and the
+# template is measured instead (NotesWorker._prompt_tokens).
 TEMPLATE_OVERHEAD_TOKENS = 256
 
-# Floor under the prompt budget. Long user instructions ride along with every
-# part and eat into MAX_INPUT_TOKENS; past this point the instructions are the
-# problem, and shrinking parts further would just produce hundreds of them.
+# The least room for transcript a prompt may be left once the instructions
+# are in. Long user instructions ride along with every part and eat into the
+# input limit; past this point the instructions are the problem, and
+# shrinking parts further would just produce hundreds of them. A check, not a
+# floor: a run that can't meet it is refused before anything is generated.
+# Granting the room anyway is what once sent prompts bigger than the window.
 MIN_PROMPT_TOKENS = 2000
 
 DEFAULT_INSTRUCTIONS = (
@@ -901,6 +906,8 @@ class NotesWorker(QThread):
         # app's own sizing only ever sees the text.
         self._last_prompt_tokens = 0
         self._peak_prompt_tokens = 0
+        # Set once any prompt had to be sized without the server's count.
+        self._sizing_estimated = False
 
     def stop(self) -> None:
         self._stop = True
@@ -928,7 +935,13 @@ class NotesWorker(QThread):
         return DEFAULT_CONTEXT_SIZE
 
     def _max_input_tokens(self) -> int:
-        return _input_tokens(self._context_size())
+        """The most one whole prompt may hold, chat template and all.
+
+        A reasoning model's extra completion allowance comes out of here: the
+        server allocated its cache for the window, and wanting a longer
+        answer does not change what it allocated.
+        """
+        return _input_tokens(self._context_size()) - self._reasoning_budget()
 
     # ---------- generation ----------
 
@@ -940,17 +953,21 @@ class NotesWorker(QThread):
         response.raise_for_status()
         return len(response.json().get("tokens", []))
 
-    def _generate(self, port: int, user_prompt: str, stream: bool) -> str:
-        import requests
+    def _request(self, user_prompt: str) -> dict:
+        """The chat-completion body for one prompt, sent and counted alike.
 
-        messages = [
-            {"role": "system",
-             "content": "You take clear, structured notes on conversation transcripts."},
-            {"role": "user", "content": user_prompt},
-        ]
+        Counting goes through this same builder as generation because the
+        template policy changes what a prompt costs: a thinking switch or a
+        reasoning effort is rendered into the prompt by the chat template,
+        so a count taken without it would be of some other prompt.
+        """
         model = self.model or NotesModel("")
         payload = {
-            "messages": messages,
+            "messages": [
+                {"role": "system",
+                 "content": "You take clear, structured notes on conversation transcripts."},
+                {"role": "user", "content": user_prompt},
+            ],
             "max_tokens": self._max_new_tokens(),
             "temperature": 0.7 if model.temperature is None else model.temperature,
             "top_p": 0.8 if model.top_p is None else model.top_p,
@@ -973,7 +990,27 @@ class NotesWorker(QThread):
             payload["reasoning_effort"] = model.reasoning_effort
         if template_kwargs:
             payload["chat_template_kwargs"] = template_kwargs
+        return payload
 
+    def _count_request(self, port: int, user_prompt: str) -> int:
+        """The server's count of a prompt, rendered as it would be generated.
+
+        /v1/chat/completions/input_tokens parses the body exactly as
+        /v1/chat/completions does — template, system message, policy — and
+        counts the result with its special tokens.
+        """
+        import requests
+
+        response = requests.post(
+            f"http://127.0.0.1:{port}/v1/chat/completions/input_tokens",
+            json=self._request(user_prompt), timeout=120)
+        response.raise_for_status()
+        return int(response.json()["input_tokens"])
+
+    def _generate(self, port: int, user_prompt: str, stream: bool) -> str:
+        import requests
+
+        payload = self._request(user_prompt)
         tokens = 0
         reasoning_tokens = 0
         finish_reason = None
@@ -1084,30 +1121,62 @@ class NotesWorker(QThread):
 
         Sizing has to degrade rather than fail: one flaky /tokenize call
         shouldn't abort a notes run that may already be twenty minutes in.
-        Callers fall back to the measured character ratio.
+        Callers fall back to the measured character ratio, and the run is
+        reported as sized by estimate.
         """
         try:
             return self._count_tokens(port, text)
         except Exception:
+            self._sizing_estimated = True
             return None
 
-    def _prompt_budget(self, port: int) -> int:
-        """Tokens available for prompt *content* beside the instructions.
+    def _prompt_tokens(self, port: int, user_prompt: str) -> int:
+        """What one whole prompt costs, as the server will hold it.
 
-        The model's own input budget covers the whole prompt, and the
-        instructions ride along with every single part — they are
-        user-editable and can be long, so they are measured rather than
-        assumed small. A reasoning model's extra completion allowance is
-        taken out of here too: the server allocated its cache for the
-        window, and wanting a longer answer does not change what it
-        allocated.
+        The server's own count of the rendered request when it can give one.
+        Otherwise the text alone with TEMPLATE_OVERHEAD_TOKENS standing in
+        for the template — or, with /tokenize out as well, the character
+        guess — and the run is marked as sized by estimate, since nothing
+        then guarantees the fit.
         """
-        instructions = self._try_count_tokens(port, self.instructions)
-        if instructions is None:
-            instructions = int(len(self.instructions) / CHARS_PER_TOKEN)
-        return max(MIN_PROMPT_TOKENS,
-                   self._max_input_tokens() - instructions
-                   - TEMPLATE_OVERHEAD_TOKENS - self._reasoning_budget())
+        try:
+            return self._count_request(port, user_prompt)
+        except Exception:
+            self._sizing_estimated = True
+        text = self._try_count_tokens(port, user_prompt)
+        if text is None:
+            text = int(len(user_prompt) / CHARS_PER_TOKEN)
+        return text + TEMPLATE_OVERHEAD_TOKENS
+
+    def _budgets(self, port: int) -> tuple[int, int, int]:
+        """Room for content in a direct, a part and a combining prompt.
+
+        Each is the input limit less that prompt with its content left
+        empty: the instructions, which ride along with every pass and are
+        user-editable, so measured rather than assumed small; the wrapper
+        text; the system message and chat template. Measured once a run,
+        since only the content changes from pass to pass — the part prompt
+        at the widest label a run will plausibly print.
+
+        Raises, before anything is generated, when any of them is under
+        MIN_PROMPT_TOKENS: the instructions are then the problem, and no way
+        of cutting up the transcript gets round them.
+        """
+        limit = self._max_input_tokens()
+        costs = (self._prompt_tokens(port, self._direct_prompt("")),
+                 self._prompt_tokens(port, self._part_prompt("", 999, 999)),
+                 self._prompt_tokens(port, self._combine_prompt("")))
+        room = limit - max(costs)
+        if room < MIN_PROMPT_TOKENS:
+            about = "about " if self._sizing_estimated else ""
+            raise ValueError(
+                f"The AI instructions are too long for this notes model. With "
+                f"them in, a prompt has room for {about}{max(0, room):,} tokens "
+                f"of transcript out of the {limit:,} the model can read at "
+                f"once, and it needs at least {MIN_PROMPT_TOKENS:,}. Shorten "
+                f"the AI instructions, or choose a notes model with a larger "
+                f"context.")
+        return tuple(limit - cost for cost in costs)
 
     def _chars_per_token(self, total_tokens: int) -> float:
         """This transcript's own character-to-token ratio.
@@ -1191,17 +1260,30 @@ class NotesWorker(QThread):
 
         Only reachable if one notes block is over budget by itself. Cutting
         visibly — and saying so in the output — beats letting llama-server
-        drop part of the prompt without telling anyone.
+        drop part of the prompt without telling anyone. The notice is part of
+        the prompt as well, so it is counted with the text it ends.
         """
-        tokens = self._try_count_tokens(port, text)
-        if tokens is None:
-            tokens = max(1, int(len(text) / chars_per_token))
-        if tokens <= budget:
-            return text
-        keep = max(1, int(len(text) * budget / tokens * 0.9))
-        return text[:keep] + "\n\n*(notes truncated to fit the model's context)*"
+        notice = "\n\n*(notes truncated to fit the model's context)*"
+        trimmed = text
+        # Bounded like _pack: every pass cuts at least a tenth.
+        for _ in range(10):
+            tokens = self._try_count_tokens(port, trimmed)
+            if tokens is None:
+                tokens = max(1, int(len(trimmed) / chars_per_token))
+            if tokens <= budget:
+                break
+            keep = int(len(trimmed) * budget / tokens * 0.9) - len(notice)
+            trimmed = text[:max(1, keep)] + notice
+        return trimmed
 
     # ---------- map-reduce over a long transcript ----------
+
+    def _direct_prompt(self, transcript: str) -> str:
+        return f"{self.instructions}\n\nTranscript:\n\n{transcript}"
+
+    def _part_prompt(self, part: str, k: int, count: int) -> str:
+        return (f"{self.instructions}\n\nThis is part {k} of {count} "
+                f"of the transcript.\n\nTranscript part:\n\n{part}")
 
     def _combine_prompt(self, combined: str) -> str:
         return (f"{self.instructions}\n\nBelow are notes taken on consecutive "
@@ -1270,25 +1352,28 @@ class NotesWorker(QThread):
             port, self.model = _load(self.model_name, self.status.emit,
                                      cancelled=lambda: self._stop)
             _check_cancelled(lambda: self._stop)
+            # First, so instructions that can't fit fail the run here, with
+            # nothing generated.
+            direct_budget, part_budget, combine_budget = self._budgets(port)
             total_tokens = self._try_count_tokens(port, self.transcript)
             if total_tokens is None:
                 # /tokenize is out. Sizing falls back to the character
                 # estimate everywhere below; generation itself may well be
                 # fine, and failing the run outright would be worse.
                 total_tokens = int(len(self.transcript) / CHARS_PER_TOKEN)
-            budget = self._prompt_budget(port)
+            direct = self._direct_prompt(self.transcript)
 
-            if total_tokens <= budget:
+            # The sum says whether the direct prompt is worth counting; the
+            # count of the whole prompt says whether it fits.
+            if (total_tokens <= direct_budget
+                    and self._prompt_tokens(port, direct) <= self._max_input_tokens()):
                 self.status.emit("Writing notes…")
-                self._generate(
-                    port,
-                    f"{self.instructions}\n\nTranscript:\n\n{self.transcript}",
-                    stream=True)
+                self._generate(port, direct, stream=True)
             else:
                 # Long transcript: notes per part, then a combining pass.
                 chars_per_token = self._chars_per_token(total_tokens)
                 parts = self._split_transcript(
-                    port, min(_part_tokens(self._context_size()), budget),
+                    port, min(_part_tokens(self._context_size()), part_budget),
                     chars_per_token)
                 self._passes_total = len(parts) + 1
                 part_notes = []
@@ -1297,13 +1382,10 @@ class NotesWorker(QThread):
                         break
                     self.status.emit(f"Reading transcript — part {k} of {len(parts)}…")
                     notes = self._generate(
-                        port,
-                        f"{self.instructions}\n\nThis is part {k} of {len(parts)} "
-                        f"of the transcript.\n\nTranscript part:\n\n{part}",
-                        stream=False)
+                        port, self._part_prompt(part, k, len(parts)), stream=False)
                     part_notes.append(notes)
                 if not self._stop:
-                    self._combine(port, part_notes, budget, chars_per_token)
+                    self._combine(port, part_notes, combine_budget, chars_per_token)
                 if self._stop:
                     # Covers a cancel during the parts (nothing emitted yet)
                     # and during the combining pass (a merge that stops
@@ -1347,15 +1429,22 @@ class NotesWorker(QThread):
         if self._truncated_passes:
             parts.append(f"{self._truncated_passes} pass(es) cut off at the "
                          f"{self._max_new_tokens()}-token limit")
+        if self._sizing_estimated:
+            parts.append("prompts sized by estimate, as the server couldn't "
+                         "count them")
         if parts:
             self.status.emit("Notes finished — " + "; ".join(parts) + ".")
-        if self._peak_prompt_tokens > self._context_size() - MAX_NEW_TOKENS:
-            # The text was sized to fit; the template pushed it over. That
-            # means llama-server silently dropped the front of a prompt, so
-            # say so rather than leaving it to be noticed in the notes.
+        if self._peak_prompt_tokens > self._context_size() - self._max_new_tokens():
+            # Every prompt was sized to leave the whole completion allowance,
+            # reasoning included; the server says one didn't. That costs the
+            # notes their end, or llama-server dropped part of the prompt, so
+            # say so rather than leaving it to be noticed in the notes. With
+            # sizing estimated, the template guess is what fell short.
+            knob = ("TEMPLATE_OVERHEAD_TOKENS" if self._sizing_estimated
+                    else "CONTEXT_HEADROOM")
             self.status.emit(
                 f"Warning: a prompt reached {self._peak_prompt_tokens} tokens — "
-                f"raise TEMPLATE_OVERHEAD_TOKENS for this model.")
+                f"raise {knob} for this model.")
 
 
 def _split_long_line(line: str, limit: int) -> list[str]:

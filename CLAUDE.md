@@ -281,6 +281,12 @@ is ever applied automatically; a typed value is the undo.
   cuts audio into VAD speech regions, detects language once from the
   clearest sample and locks it for the whole track, then drops segments
   written in a script the locked language can't use (`_foreign_script`).
+  Its languages are a closed list: `QWEN_LANGUAGE_NAMES` holds only names
+  qwen-asr accepts (0.0.6 has no Norwegian or Ukrainian), and
+  `language_supported` is checked twice. The window greys out what the
+  chosen model lacks and refuses a selection it already had, never turning
+  it into auto-detect; `TranscribeWorker.run` refuses it before any model
+  loads, so the error can't reach the GPU-to-CPU retry.
 
 Adding a model usually means adding an alias to `WHISPER_ALIASES` /
 `ONNX_ALIASES` / `QWEN_REPOS`, and (for the UI) to `MODEL_GROUPS` in
@@ -302,10 +308,20 @@ several GB of VRAM. Long transcripts are handled map-reduce style: notes per
 part, then a combining pass. **Every prompt is sized by real tokens**: parts
 are cut at line boundaries using the ratio measured from this transcript and
 then verified against the server's `/tokenize` (`_pack`), and the combining
-pass reduces in rounds when the per-part notes don't fit one prompt.
+pass reduces in rounds when the per-part notes don't fit one prompt. What a
+prompt carries besides its content — the instructions, the wrapper text, the
+system message and the chat template — is measured once a run by having the
+server count the whole request (`/v1/chat/completions/input_tokens`), and
+taken off the input limit (`_budgets`). That request comes from the same
+`_request` builder as generation, because a thinking switch or reasoning
+effort changes what the template renders. Instructions that leave less than
+`MIN_PROMPT_TOKENS` of room fail the run with a message saying to shorten
+them, before anything is generated: the minimum is a check, never a floor —
+granting it anyway once sent prompts bigger than the whole window.
 `CHARS_PER_TOKEN` is only a starting guess and a fallback for when
-`/tokenize` is unreachable — don't reintroduce it as the sizing rule; an
-oversized prompt is truncated by llama-server silently.
+`/tokenize` is unreachable, as `TEMPLATE_OVERHEAD_TOKENS` is for the request
+count — don't reintroduce either as the sizing rule; an oversized prompt is
+truncated by llama-server silently. A run sized by either fallback says so.
 
 Models are GGUFs listed in `LLM_REPOS` as `NotesModel` records: repo, exact
 filename, an optional pinned revision, and the generation policy for those
@@ -403,6 +419,12 @@ come from pip wheels. `cuda_setup.py` adds their directories to the DLL
 search path **and must be imported before ctranslate2/faster_whisper load**
 (`transcriber.py` imports it first, `# noqa: F401`). In the frozen build the
 DLLs come from torch's bundled `torch/lib` set instead of the nvidia wheels.
+Whatever loads them has to be a CUDA 12 build: torch is `+cu128` from
+PyTorch's index, and onnxruntime-gpu comes from Microsoft's CUDA 12 feed,
+because PyPI's is built for CUDA 13 from 1.27 on. `pip freeze` records
+neither source, so the install order and the onnxruntime wheel's hash live
+in the header of `requirements.lock.txt`; change it and the README's setup
+steps together.
 
 `runtime.py` centralizes every path that differs between source and the
 PyInstaller build (`IS_FROZEN`): `bundle_dir()` (read-only bundled data),
@@ -451,9 +473,15 @@ What is pinned, and why it is worth keeping pinned:
   everything downstream assumes; `test_merger` also pins the
   `MAX_COALESCE_CHARS` invariant that `llm.py`'s line-boundary splitting
   depends on, which is otherwise only a comment reaching across two modules.
+  `test_transcriber` also checks Qwen's language list against the installed
+  qwen-asr's, read from its source rather than imported (that loads torch).
 - `test_exporters` — timestamp formats, VTT escaping, and `target_paths`
   (the "Session 2.5" case, where `with_suffix` would write a file the user
-  never named).
+  never named). Also that every export replaces each file whole or not at
+  all: all of them are staged beside their targets before any is renamed
+  over one, and a rename that fails raises an `ExportError` (an `OSError`)
+  naming the files already new and the ones still old. Five renames are
+  not one transaction; don't let a docstring claim they are.
 - `test_merger.Offsets` / `test_align` — the offset applied once, to copies,
   with all-zero offsets giving exactly the old order; and every input form
   the Offset column accepts or rejects, with its reason. `test_align` also
@@ -464,13 +492,16 @@ What is pinned, and why it is worth keeping pinned:
 - `test_llm` — catalog integrity, model resolution, and the identity policy,
   including that a typed `repo::file.gguf` gets the same policy as its
   alias. Prompt sizing is exercised through a `NotesWorker` subclass whose
-  `_try_count_tokens` is a ratio, so the real packing and splitting run
-  without a server.
+  `_try_count_tokens` is a ratio and whose `_count_request` adds a template
+  to it, so the real packing, splitting, budgets and `run()` go without a
+  server.
 - `test_generation` — a fake llama-server (`http.server` + SSE) that records
   the request and replays a scripted stream. It is the only way to check the
-  payload fields (thinking switches, reasoning effort) and the stream fields
-  (`reasoning_content`, `finish_reason`, the usage-only final event) without
-  a 10 GB model. Extend this rather than mocking `requests`.
+  payload fields (thinking switches, reasoning effort), the stream fields
+  (`reasoning_content`, `finish_reason`, the usage-only final event) and
+  what every prompt of a whole run costs, counted with the request's own
+  template policy, without a 10 GB model. Extend this rather than mocking
+  `requests`.
 - `test_render` — the incremental transcript render, asserted equal to a
   full redraw. Qt runs on the offscreen platform; the module sets
   `QT_QPA_PLATFORM` before importing `QtWidgets`, so leave that import order
@@ -479,7 +510,10 @@ What is pinned, and why it is worth keeping pinned:
   window (offscreen), plus the Offset column driven through its real cell
   editor. Typed edits commit through `_OffsetDelegate`, not `itemChanged`:
   Qt drops a write of unchanged text, and retyping the shown `0:00` is a
-  deliberate "starts at zero" that must still count as typed. `Alignment`
+  deliberate "starts at zero" that must still count as typed. The export
+  warning is driven through `export_dialog`: a track that failed, was
+  cancelled or never ran counts whether or not it produced a segment, and
+  a finished track with none (silent audio) does not. `Alignment`
   runs the real `AlignWorker` thread with `run()` scripted and plays the
   review window by replacing only its `exec()`. Each test deletes its
   window in cleanup rather than leaving it to the garbage collector:
