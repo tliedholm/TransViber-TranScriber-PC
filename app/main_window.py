@@ -63,6 +63,7 @@ from transcriber import (
     TranscribeWorker,
     engine_for,
     free_asr_models,
+    language_supported,
 )
 
 # Grouped by the user's preferred quality/speed tiers.
@@ -521,8 +522,8 @@ class MainWindow(QMainWindow):
             "benchmarks. All CC-BY-4.0. None of those rankings has been\n"
             "measured on recordings like yours.\n"
             "\n"
-            "The Language setting applies to Whisper and Qwen. NVIDIA models\n"
-            "ignore it and auto-detect."
+            "The Language setting applies to Whisper and Qwen (Qwen has no\n"
+            "Norwegian or Ukrainian). NVIDIA models ignore it and auto-detect."
         )
         bar.addWidget(self.combo_model)
         bar.addWidget(self._make_star_button(self.combo_model, "starred_model"))
@@ -532,6 +533,12 @@ class MainWindow(QMainWindow):
         for name, code in LANGUAGES:
             self.combo_lang.addItem(name, code)
         bar.addWidget(self.combo_lang)
+        # Shown while the chosen language is one the model can't take.
+        self.label_lang_conflict = QLabel("⚠ Not supported by this model")
+        self.label_lang_conflict.hide()
+        bar.addWidget(self.label_lang_conflict)
+        self.combo_model.currentTextChanged.connect(self._update_language_choices)
+        self.combo_lang.currentIndexChanged.connect(self._update_language_choices)
 
         bar.addWidget(QLabel("Device:"))
         self.combo_device = QComboBox()
@@ -865,6 +872,32 @@ class MainWindow(QMainWindow):
     def _update_hints_visibility(self) -> None:
         model = self.combo_model.currentText().strip()
         self.hints_widget.setVisible(engine_for(model) in ("whisper", "qwen"))
+
+    def _update_language_choices(self) -> None:
+        """Grey out the languages the chosen model can't take.
+
+        One that is already selected stays selected and is flagged, rather
+        than quietly becoming Auto-detect, which would change what was asked
+        for; Transcribe refuses it until the language or model changes.
+        """
+        model = self.combo_model.currentText().strip()
+        items = self.combo_lang.model()
+        for row in range(self.combo_lang.count()):
+            supported = language_supported(model, self.combo_lang.itemData(row))
+            items.item(row).setEnabled(supported)
+            items.item(row).setToolTip("" if supported else f"Not supported by {model}.")
+        conflict = self._language_conflict()
+        self.label_lang_conflict.setToolTip(conflict or "")
+        self.label_lang_conflict.setVisible(conflict is not None)
+
+    def _language_conflict(self) -> str | None:
+        """Why the chosen model can't take the chosen language, or None."""
+        model = self.combo_model.currentText().strip()
+        if language_supported(model, self.combo_lang.currentData()):
+            return None
+        language = self.combo_lang.currentText()
+        return (f"{model} can't transcribe {language}. Choose another language "
+                f"or Auto-detect, or a Whisper model for {language}.")
 
     def _hotwords_text(self) -> str:
         """Collapse the multi-line hints panel into one comma-separated string.
@@ -1309,6 +1342,10 @@ class MainWindow(QMainWindow):
         if not indices:
             QMessageBox.information(self, "No tracks", "Add at least one audio track first.")
             return
+        conflict = self._language_conflict()
+        if conflict is not None:
+            QMessageBox.warning(self, "Language not supported", conflict)
+            return
 
         for i in indices:
             track = self.tracks[i]
@@ -1736,6 +1773,7 @@ class MainWindow(QMainWindow):
             self.check_dark.setChecked(dark)
             self._set_dark_mode(dark)
         self._update_hints_visibility()
+        self._update_language_choices()
 
     def _save_settings(self) -> None:
         # The notes themselves are a file, not a registry value — see

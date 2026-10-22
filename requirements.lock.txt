@@ -11,13 +11,31 @@
 #   .venv\Scripts\python.exe -m pip install --upgrade pip
 #   .venv\Scripts\python.exe -m pip install torch==2.11.0+cu128 ^
 #       --index-url https://download.pytorch.org/whl/cu128
-#   .venv\Scripts\python.exe -m pip install -r requirements.lock.txt
+#   .venv\Scripts\python.exe -m pip install onnxruntime-gpu==1.27.1 --no-deps ^
+#       --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
+#   .venv\Scripts\python.exe -m pip install --no-deps -r requirements.lock.txt
 #
 # torch has to come first and from PyTorch's own index: the +cu128 build is
 # not on PyPI, and installing the plain torch wheel afterwards would silently
 # replace the CUDA build with the CPU one. The nvidia-*-cu12 wheels below are
 # where cuda_setup.py finds cuBLAS and cuDNN when running from source — there
 # is no CUDA Toolkit install on this machine.
+#
+# onnxruntime-gpu comes second, from Microsoft's CUDA 12 feed, for the same
+# reason: from 1.27 on, PyPI's onnxruntime-gpu is built for CUDA 13 and can't
+# use the CUDA 12 DLLs above, and 1.27.1 isn't on PyPI at all. The wheel in
+# the .venv is that feed's
+#   onnxruntime_gpu-1.27.1-cp314-cp314-win_amd64.whl
+#   sha256 e879c96037fe282157fce15cedbc0e998dfdac17f75ee6cd455d08fad6b49dd3
+# (onnxruntime.capi.build_and_package_info.cuda_version == "12.8"). A version
+# number alone can't tell the CUDA 12 and CUDA 13 builds apart.
+#
+# The lock goes in with --no-deps because it already lists every package.
+# Without it, faster-whisper's dependency on plain `onnxruntime` pulls in the
+# CPU build, which installs into the same onnxruntime\ folder and replaces
+# the CUDA one. So `pip check` reporting "faster-whisper requires
+# onnxruntime, which is not installed" is expected: onnxruntime-gpu provides
+# that module.
 #
 # Not captured here, and not pip-installable:
 #   llama-cpp/    the llama.cpp CUDA server binary + DLLs (b10034,
@@ -28,6 +46,9 @@
 # Regenerate after changing the venv:
 #   .venv\Scripts\python.exe -m pip freeze > requirements.lock.txt
 #   (then put this header back on top)
+# pip freeze records versions, not where a wheel came from. When upgrading
+# onnxruntime-gpu, take the new version from the CUDA 12 feed and update the
+# file name, hash and command above, and the matching step in README.md.
 
 accelerate==1.12.0
 altgraph==0.17.5
