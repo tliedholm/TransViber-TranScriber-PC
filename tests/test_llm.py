@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import tests  # noqa: F401  (puts app/ on sys.path)
 
@@ -250,7 +251,7 @@ class PerModelContext(unittest.TestCase):
         self.assertEqual(worker._max_input_tokens(),
                          65536 - MAX_NEW_TOKENS - llm.CONTEXT_HEADROOM)
         self.assertEqual(worker._max_new_tokens(), MAX_NEW_TOKENS)
-        self.assertGreater(worker._prompt_budget(0), MAX_INPUT_TOKENS)
+        self.assertGreater(min(worker._budgets(0)), MAX_INPUT_TOKENS)
 
     def test_parts_scale_with_the_window(self):
         self.assertEqual(llm._part_tokens(llm.DEFAULT_CONTEXT_SIZE), 14000)
@@ -417,12 +418,40 @@ class SplitLongLine(unittest.TestCase):
 
 
 class StubbedWorker(NotesWorker):
-    """A worker whose token counts come from a ratio instead of a server."""
+    """A worker whose token counts come from a ratio instead of a server.
+
+    The whole-request count goes through the real request builder, the way
+    the server's does, and adds a template of its own.
+    """
 
     CHARS_PER_TOKEN = 4.0
+    TEMPLATE_TOKENS = 30
 
     def _try_count_tokens(self, port, text):
         return max(1, round(len(text) / self.CHARS_PER_TOKEN))
+
+    def _count_request(self, port, user_prompt):
+        text = "".join(m["content"] for m in self._request(user_prompt)["messages"])
+        return self._try_count_tokens(port, text) + self.TEMPLATE_TOKENS
+
+
+class RecordingWorker(StubbedWorker):
+    """Runs the real run() with the model load and generation stubbed out."""
+
+    def __init__(self, *args, model=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._model = model or NotesModel("owner/Repo", "f.gguf")
+        self.prompts: list[str] = []
+        self.failures: list[str] = []
+        self.failed.connect(self.failures.append)
+
+    def _generate(self, port, user_prompt, stream):
+        self.prompts.append(user_prompt)
+        return "notes"
+
+    def run(self):
+        with mock.patch.object(llm, "_load", return_value=(0, self._model)):
+            super().run()
 
 
 class Sizing(unittest.TestCase):
@@ -430,9 +459,21 @@ class Sizing(unittest.TestCase):
         self.worker = StubbedWorker("", model_name="qwen3-4b")
 
     def test_instructions_come_out_of_the_prompt_budget(self):
-        budget = self.worker._prompt_budget(0)
-        self.assertLess(budget, MAX_INPUT_TOKENS)
-        self.assertGreater(budget, llm.MIN_PROMPT_TOKENS)
+        for budget in self.worker._budgets(0):
+            self.assertLess(budget, MAX_INPUT_TOKENS)
+            self.assertGreater(budget, llm.MIN_PROMPT_TOKENS)
+
+    def test_the_template_and_wrapper_are_charged_too(self):
+        """Not just the instructions: everything in the prompt but its content."""
+        instructions = self.worker._try_count_tokens(0, self.worker.instructions)
+        for budget in self.worker._budgets(0):
+            self.assertLess(budget, MAX_INPUT_TOKENS - instructions
+                            - StubbedWorker.TEMPLATE_TOKENS)
+
+    def test_the_combining_wrapper_is_the_largest(self):
+        direct, part, combine = self.worker._budgets(0)
+        self.assertGreater(direct, part)
+        self.assertGreater(direct, combine)
 
     def test_a_reasoning_model_trades_prompt_room_for_answer_room(self):
         """Its extra completion allowance must not enlarge the context.
@@ -453,13 +494,82 @@ class Sizing(unittest.TestCase):
                 self.assertEqual(
                     reasoning._max_new_tokens(),
                     plain._max_new_tokens() + llm.REASONING_EXTRA_TOKENS)
+                # Taken out once, not once per place it is mentioned.
+                for with_reasoning, without in zip(reasoning._budgets(0),
+                                                   plain._budgets(0)):
+                    self.assertEqual(with_reasoning + reasoning._max_new_tokens(),
+                                     without + plain._max_new_tokens())
                 self.assertEqual(
-                    reasoning._prompt_budget(0) + reasoning._max_new_tokens(),
-                    plain._prompt_budget(0) + plain._max_new_tokens())
+                    reasoning._max_input_tokens() + reasoning._max_new_tokens()
+                    + llm.CONTEXT_HEADROOM,
+                    reasoning._context_size())
 
-    def test_enormous_instructions_cannot_drive_the_budget_to_nothing(self):
+    def test_instructions_that_leave_no_room_are_refused(self):
+        """Once a floor that granted room the window didn't have."""
         worker = StubbedWorker("", instructions="x" * 400_000)
-        self.assertEqual(worker._prompt_budget(0), llm.MIN_PROMPT_TOKENS)
+        with self.assertRaises(ValueError) as caught:
+            worker._budgets(0)
+        message = str(caught.exception)
+        self.assertIn("Shorten the AI instructions", message)
+        self.assertIn("room for 0 tokens", message)
+        self.assertIn(f"{llm.MIN_PROMPT_TOKENS:,}", message)
+        self.assertNotIn("about", message)  # the server counted them
+
+    def test_the_minimum_is_met_exactly_or_refused(self):
+        limit = self.worker._max_input_tokens()
+        for room, refused in ((llm.MIN_PROMPT_TOKENS + 1, False),
+                              (llm.MIN_PROMPT_TOKENS, False),
+                              (llm.MIN_PROMPT_TOKENS - 1, True)):
+            with self.subTest(room=room):
+                worker = StubbedWorker("")
+                with mock.patch.object(worker, "_count_request",
+                                       return_value=limit - room):
+                    if refused:
+                        with self.assertRaises(ValueError):
+                            worker._budgets(0)
+                    else:
+                        self.assertEqual(worker._budgets(0), (room,) * 3)
+
+    def test_a_bigger_window_takes_bigger_instructions(self):
+        instructions = "x" * 80_000  # ~20,000 tokens: past the default window
+        with self.assertRaises(ValueError):
+            StubbedWorker("", instructions=instructions)._budgets(0)
+        worker = StubbedWorker("", instructions=instructions)
+        worker.model = NotesModel("owner/Repo", "f.gguf", context=65536)
+        self.assertGreaterEqual(min(worker._budgets(0)), llm.MIN_PROMPT_TOKENS)
+
+    def test_an_estimated_refusal_says_it_is_an_estimate(self):
+        worker = StubbedWorker("", instructions="x" * 400_000)
+        with mock.patch.object(worker, "_count_request",
+                               side_effect=OSError("not found")):
+            with self.assertRaises(ValueError) as caught:
+                worker._budgets(0)
+        self.assertIn("about", str(caught.exception))
+        self.assertTrue(worker._sizing_estimated)
+
+    def test_without_the_servers_count_the_template_is_guessed(self):
+        worker = StubbedWorker("")
+        with mock.patch.object(worker, "_count_request",
+                               side_effect=OSError("not found")):
+            tokens = worker._prompt_tokens(0, "x" * 4000)
+        self.assertEqual(tokens, 1000 + llm.TEMPLATE_OVERHEAD_TOKENS)
+        self.assertTrue(worker._sizing_estimated)
+
+    def test_without_any_count_the_characters_are_guessed(self):
+        worker = StubbedWorker("")
+        with mock.patch.object(worker, "_count_request",
+                               side_effect=OSError("not found")), \
+                mock.patch.object(worker, "_count_tokens",
+                                  side_effect=OSError("not found")), \
+                mock.patch.object(StubbedWorker, "_try_count_tokens",
+                                  NotesWorker._try_count_tokens):
+            tokens = worker._prompt_tokens(0, "x" * 3500)
+        self.assertEqual(tokens, 1000 + llm.TEMPLATE_OVERHEAD_TOKENS)
+        self.assertTrue(worker._sizing_estimated)
+
+    def test_a_counted_run_is_not_called_an_estimate(self):
+        self.worker._budgets(0)
+        self.assertFalse(self.worker._sizing_estimated)
 
     def test_packing_never_exceeds_the_budget(self):
         items = [f"line {i} " + "word " * 40 for i in range(200)]
@@ -508,6 +618,74 @@ class Sizing(unittest.TestCase):
         trimmed = self.worker._trim_to_budget(0, text, 500, 4.0)
         self.assertLess(len(trimmed), len(text))
         self.assertIn("truncated", trimmed)
+
+    def test_the_truncation_notice_is_counted_in(self):
+        for budget in (40, 100, 500, 2000):
+            with self.subTest(budget=budget):
+                trimmed = self.worker._trim_to_budget(0, "x" * 100_000, budget, 4.0)
+                self.assertLessEqual(self.worker._try_count_tokens(0, trimmed),
+                                     budget)
+
+    def test_text_that_fits_is_not_trimmed(self):
+        self.assertEqual(self.worker._trim_to_budget(0, "x" * 400, 100, 4.0),
+                         "x" * 400)
+
+
+class Runs(unittest.TestCase):
+    """run() end to end, with counts from the stub and no generation."""
+
+    def transcript_of(self, tokens: int) -> str:
+        # Four characters a token and no newline: counts add up exactly.
+        return "x" * (tokens * 4)
+
+    def direct_budget(self) -> int:
+        return StubbedWorker("")._budgets(0)[0]
+
+    def test_a_transcript_at_the_limit_is_one_prompt(self):
+        worker = RecordingWorker(self.transcript_of(self.direct_budget()))
+        worker.run()
+        self.assertEqual(worker.failures, [])
+        self.assertEqual(len(worker.prompts), 1)
+        self.assertEqual(worker._prompt_tokens(0, worker.prompts[0]),
+                         worker._max_input_tokens())
+
+    def test_one_token_over_is_split(self):
+        worker = RecordingWorker(self.transcript_of(self.direct_budget() + 1))
+        worker.run()
+        self.assertEqual(worker.failures, [])
+        self.assertGreater(len(worker.prompts), 1)
+        self.assertTrue(any("This is part 1 of" in p for p in worker.prompts))
+
+    def test_a_prompt_that_only_fits_on_paper_is_split(self):
+        """The sum of the pieces fits; the whole prompt, counted, doesn't."""
+        worker = RecordingWorker(self.transcript_of(self.direct_budget()))
+        count = worker._count_request
+
+        def joins_badly(port, user_prompt):
+            return count(port, user_prompt) + (5 if user_prompt.endswith("x") else 0)
+
+        with mock.patch.object(worker, "_count_request", side_effect=joins_badly):
+            worker.run()
+        self.assertGreater(len(worker.prompts), 1)
+
+    def test_every_prompt_of_a_long_run_fits(self):
+        worker = RecordingWorker(
+            "\n".join(f"Speaker {i}: " + "word " * 60 for i in range(1500)))
+        worker.run()
+        self.assertEqual(worker.failures, [])
+        self.assertGreater(len(worker.prompts), 2)
+        for prompt in worker.prompts:
+            self.assertLessEqual(worker._prompt_tokens(0, prompt),
+                                 worker._max_input_tokens())
+
+    def test_instructions_that_cannot_fit_never_reach_generation(self):
+        for transcript in ("Alice: hi.", self.transcript_of(50_000)):
+            with self.subTest(long=len(transcript) > 100):
+                worker = RecordingWorker(transcript, instructions="x" * 400_000)
+                worker.run()
+                self.assertEqual(worker.prompts, [])
+                self.assertEqual(len(worker.failures), 1)
+                self.assertIn("Shorten the AI instructions", worker.failures[0])
 
 
 if __name__ == "__main__":
