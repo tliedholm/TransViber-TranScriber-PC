@@ -313,6 +313,7 @@ class Alignment(_WindowTest):
             def __init__(inner, *args, **kwargs):
                 super().__init__(*args, **kwargs)
                 seen["constructed"] = (inner.units, inner.session_reference)
+                seen["known"] = inner.known
 
             def run(inner):
                 if run is not None:
@@ -637,6 +638,30 @@ class Alignment(_WindowTest):
         """The result an automatic-mode run hands over, anchored at `anchor`."""
         return align.rebase(AlignmentResult([], AUTOMATIC_REFERENCE, measured[0].path,
                                             measured=measured), anchor)
+
+    def test_what_align_read_is_kept_for_the_files_still_loaded(self):
+        w = self.window
+        alice, bob, carol = self.file("alice.wav"), self.file("bob.wav"), self.file("carol.wav")
+        w.add_files([alice, bob])
+        kept_alice = ((1, 10), "alice's fingerprint")
+        read = {(alice, (None,)): kept_alice, (bob, (None,)): ((2, 20), "bob's")}
+
+        def cancelled(worker):
+            worker.fingerprints = dict(read)
+            worker.cancelled = True
+        seen = self.align([], run=cancelled)
+        self.assertEqual(seen["known"], {})
+        self.assertEqual(w._align_fingerprints, read)     # a cancelled run's too
+
+        w.table.selectRow(1)
+        w.remove_selected()
+        w.add_files([carol])
+        result = AlignmentResult([Suggestion(alice, 0.0, "reference", "r"),
+                                  Suggestion(carol, 4.0, "matched", "m", "strong")],
+                                 AUTOMATIC_REFERENCE, alice)
+        seen = self.align([], result=result)
+        self.assertEqual(seen["known"], {(alice, (None,)): kept_alice})
+        self.assertEqual(w._align_fingerprints, {(alice, (None,)): kept_alice})
 
     def run_while(self, result, during):
         """A worker run that lets `during` happen on the main thread, then finishes."""

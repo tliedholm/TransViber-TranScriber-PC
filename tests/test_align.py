@@ -8,6 +8,7 @@ not the thresholds, which are still to be calibrated on real recordings.
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 import wave
@@ -720,6 +721,13 @@ class Worker(_Session):
         rows = {s.path.stem: s for s in worker.result.suggestions}
         self.assertIn("no usable audio", rows["b"].reason)
 
+    def test_a_file_that_cannot_be_looked_at_is_not_kept(self):
+        # These paths don't exist on disk, so there is no telling later
+        # whether they changed.
+        worker = self._worker({"a": self.mix, "b": self.late})
+        self.assertIsNotNone(worker.result)
+        self.assertEqual(worker.fingerprints, {})
+
     def test_nothing_readable_is_an_error(self):
         worker = self._worker({"a": OSError("x"), "b": OSError("y")})
         self.assertIsNone(worker.result)
@@ -775,6 +783,54 @@ def _write_float_wav(path: Path, frames) -> Path:
 
 class RealDecode(unittest.TestCase):
     """The whole path through PyAV: files on disk to a suggestion."""
+
+    def _session(self, folder):
+        session = speech(300, 50) + 0.5 * speech(300, 51) + hiss(300, 52)
+        own = speech(300, 50) + hiss(300, 53)
+        return (_write_wav(Path(folder, "session.wav"), session, 1),
+                _write_wav(Path(folder, "late.wav"), own[4137:], 2))
+
+    def test_a_second_run_reuses_what_the_first_read(self):
+        with tempfile.TemporaryDirectory() as folder:
+            reference, late = self._session(folder)
+            first = AlignWorker([(late, [None])], {}, (reference, [None]))
+            first.run()
+            self.assertEqual(set(first.fingerprints), {(reference, (None,)), (late, (None,))})
+            again = AlignWorker([(late, [None])], {}, (reference, [None]),
+                                known=first.fingerprints)
+            with patch("align.decode_energy", side_effect=AssertionError("decoded again")):
+                again.run()
+        self.assertEqual(again.error, "")
+        self.assertEqual(again.result.suggestions, first.result.suggestions)
+        self.assertEqual(again.fingerprints, first.fingerprints)
+
+    def test_a_file_changed_since_is_read_again(self):
+        with tempfile.TemporaryDirectory() as folder:
+            reference, late = self._session(folder)
+            first = AlignWorker([(late, [None])], {}, (reference, [None]))
+            first.run()
+            st = late.stat()
+            os.utime(late, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+            again = AlignWorker([(late, [None])], {}, (reference, [None]),
+                                known=first.fingerprints)
+            with patch("align.decode_energy", wraps=align.decode_energy) as decode:
+                again.run()
+            self.assertEqual([c.args[0] for c in decode.call_args_list], [late])
+            # Kept against the file as it is now, not as it was.
+            self.assertEqual(again.fingerprints[(late, (None,))][0],
+                             (late.stat().st_mtime_ns, late.stat().st_size))
+        self.assertEqual(again.result.suggestions, first.result.suggestions)
+
+    def test_other_streams_of_the_same_file_are_read_again(self):
+        with tempfile.TemporaryDirectory() as folder:
+            reference, late = self._session(folder)
+            first = AlignWorker([(late, [None])], {}, (reference, [None]))
+            first.run()
+            again = AlignWorker([(late, [0])], {}, (reference, [None]),
+                                known=first.fingerprints)
+            with patch("align.decode_energy", wraps=align.decode_energy) as decode:
+                again.run()
+        self.assertEqual([c.args[:2] for c in decode.call_args_list], [(late, 0)])
 
     def test_aligns_a_late_file_against_a_session_reference(self):
         with tempfile.TemporaryDirectory() as folder:
