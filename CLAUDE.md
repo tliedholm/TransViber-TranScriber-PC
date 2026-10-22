@@ -460,7 +460,10 @@ What is pinned, and why it is worth keeping pinned:
   Qt drops a write of unchanged text, and retyping the shown `0:00` is a
   deliberate "starts at zero" that must still count as typed. `Alignment`
   runs the real `AlignWorker` thread with `run()` scripted and plays the
-  review window by replacing only its `exec()`.
+  review window by replacing only its `exec()`. Each test deletes its
+  window in cleanup rather than leaving it to the garbage collector:
+  collecting a `MainWindow` crashes PySide6 6.11.1 (the pinned version)
+  with an access violation partway through a later test.
 
 Nothing here touches a GPU, a model or the network, and it should stay that
 way — `--selftest` is where real inference gets verified.

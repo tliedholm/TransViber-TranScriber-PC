@@ -15,7 +15,7 @@ import tests  # noqa: F401
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSettings, Qt, QTimer
+from PySide6.QtCore import QCoreApplication, QEvent, QSettings, Qt, QTimer
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QLineEdit
@@ -45,9 +45,17 @@ class _WindowTest(unittest.TestCase):
         self._patch("main_window.StatsPoller.start")
         self._patch("main_window.DeviceProbe.start")
         self.window = main_window.MainWindow()
-        self.addCleanup(self.window.close)
+        self.addCleanup(self._dispose_window)
         _app.processEvents()  # consume the deferred, mocked device probe
         self.window._on_device_detected(True)
+
+    def _dispose_window(self):
+        """Close the window and delete it now. Left to the garbage collector,
+        a MainWindow crashes PySide6 6.11 (an access violation partway through
+        some later test), though 6.12 collects it cleanly."""
+        self.window.close()
+        self.window.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
     def _patch(self, target, **kwargs):
         p = patch(target, **kwargs)
