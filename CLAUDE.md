@@ -467,7 +467,10 @@ What is pinned, and why it is worth keeping pinned:
   window (offscreen), plus the Offset column driven through its real cell
   editor. Typed edits commit through `_OffsetDelegate`, not `itemChanged`:
   Qt drops a write of unchanged text, and retyping the shown `0:00` is a
-  deliberate "starts at zero" that must still count as typed. `Alignment`
+  deliberate "starts at zero" that must still count as typed. The export
+  warning is driven through `export_dialog`: a track that failed, was
+  cancelled or never ran counts whether or not it produced a segment, and
+  a finished track with none (silent audio) does not. `Alignment`
   runs the real `AlignWorker` thread with `run()` scripted and plays the
   review window by replacing only its `exec()`. Each test deletes its
   window in cleanup rather than leaving it to the garbage collector:
