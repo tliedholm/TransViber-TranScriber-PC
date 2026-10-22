@@ -1534,6 +1534,13 @@ class MainWindow(QMainWindow):
                 segments = merge_tracks(self.tracks)
                 exporters.export(path, segments, self.tracks, model_name)
                 self.statusBar().showMessage(f"Exported {path}")
+        except exporters.ExportError as exc:
+            # Some formats can be new and the rest old: say so, not just "failed".
+            if exc.written:
+                self.statusBar().showMessage(
+                    "Partly exported: " + ", ".join(p.name for p in exc.written))
+            QMessageBox.critical(
+                self, "Export incomplete" if exc.written else "Export failed", str(exc))
         except OSError as exc:
             QMessageBox.critical(self, "Export failed", str(exc))
 
@@ -1653,7 +1660,7 @@ class MainWindow(QMainWindow):
         if not path_str:
             return
         try:
-            Path(path_str).write_text(text, encoding="utf-8")
+            exporters.write_file(Path(path_str), text)
             self.statusBar().showMessage(f"Notes exported to {path_str}")
         except OSError as exc:
             QMessageBox.critical(self, "Export failed", str(exc))

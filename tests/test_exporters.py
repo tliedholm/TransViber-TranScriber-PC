@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import tests  # noqa: F401  (puts app/ on sys.path)
 
@@ -120,6 +122,115 @@ class ExportAll(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             with self.assertRaises(ValueError):
                 exporters.export(Path(folder) / "x.docx", SEGMENTS, TRACKS, "m")
+
+
+def _failing_on(call, error=None):
+    """A stand-in for `real` that raises `error` on its `call`th use (from 1)
+    and otherwise does what the real function does."""
+    error = error or PermissionError(13, "Access is denied")
+
+    def wrap(real):
+        count = {"n": 0}
+
+        def stand_in(*args, **kwargs):
+            count["n"] += 1
+            if count["n"] == call:
+                raise error
+            return real(*args, **kwargs)
+        return stand_in
+    return wrap
+
+
+class ExportFailures(unittest.TestCase):
+    """Each file is replaced whole or not at all, and a failure says exactly
+    which files are new and which still hold their old contents."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.folder = Path(temp.name)
+        self.base = self.folder / "session.md"
+        self.targets = exporters.target_paths(self.base)
+        for path in self.targets:
+            path.write_text("old " + path.suffix, encoding="utf-8")
+
+    def contents(self):
+        return {p.name: p.read_text(encoding="utf-8") for p in self.targets}
+
+    def assert_untouched(self):
+        self.assertEqual(self.contents(), {p.name: "old " + p.suffix for p in self.targets})
+
+    def assert_no_staged_files_left(self):
+        self.assertEqual(sorted(self.folder.iterdir()), sorted(self.targets))
+
+    def test_a_full_disk_while_staging_changes_nothing(self):
+        full = OSError(28, "No space left on device")
+        with patch("exporters.os.fsync", _failing_on(3, full)(os.fsync)):
+            with self.assertRaises(exporters.ExportError) as caught:
+                exporters.export_all(self.base, SEGMENTS, TRACKS, "m")
+        self.assert_untouched()
+        self.assert_no_staged_files_left()
+        error = caught.exception
+        self.assertEqual(error.written, [])
+        self.assertEqual(error.failed, self.targets[2])
+        self.assertEqual(set(error.unchanged), set(self.targets))
+        self.assertIn("No space left on device", str(error))
+        self.assertIn("Nothing was exported", str(error))
+
+    def test_a_failed_first_replacement_reports_nothing_written(self):
+        with patch("exporters.os.replace", _failing_on(1)(os.replace)):
+            with self.assertRaises(exporters.ExportError) as caught:
+                exporters.export_all(self.base, SEGMENTS, TRACKS, "m")
+        self.assert_untouched()
+        self.assert_no_staged_files_left()
+        self.assertEqual(caught.exception.written, [])
+        self.assertEqual(caught.exception.unchanged, self.targets)
+
+    def test_a_failed_second_replacement_names_what_is_new_and_what_is_old(self):
+        with patch("exporters.os.replace", _failing_on(2)(os.replace)):
+            with self.assertRaises(exporters.ExportError) as caught:
+                exporters.export_all(self.base, SEGMENTS, TRACKS, "m")
+        error = caught.exception
+        md, txt = self.targets[:2]
+        self.assertEqual(error.written, [md])
+        self.assertEqual(error.failed, txt)
+        self.assertEqual(error.unchanged, self.targets[1:])
+        self.assertIsInstance(error, OSError)   # the window's `except OSError` still catches it
+        self.assertIsInstance(error.__cause__, PermissionError)
+        # The one that was replaced is whole; the rest are exactly as they were.
+        contents = self.contents()
+        self.assertEqual(contents.pop(md.name), exporters.to_markdown(SEGMENTS, TRACKS, "m"))
+        self.assertEqual(contents, {p.name: "old " + p.suffix for p in self.targets[1:]})
+        self.assert_no_staged_files_left()
+        message = str(error)
+        self.assertIn("Exported session.md, but could not write session.txt: Access is denied",
+                      message)
+        self.assertIn("Not updated: session.txt, session.srt, session.vtt, session.json", message)
+
+    def test_a_cleanup_failure_never_hides_the_real_error(self):
+        with patch("exporters.os.replace", _failing_on(1)(os.replace)), \
+                patch("exporters.Path.unlink", side_effect=OSError("locked by antivirus")):
+            with self.assertRaises(exporters.ExportError) as caught:
+                exporters.export_all(self.base, SEGMENTS, TRACKS, "m")
+        self.assertIn("Access is denied", str(caught.exception))
+        self.assertNotIn("antivirus", str(caught.exception))
+        self.assert_untouched()
+
+    def test_a_failed_single_format_export_keeps_the_old_file(self):
+        srt = self.folder / "session.srt"
+        with patch("exporters.os.replace", _failing_on(1)(os.replace)):
+            with self.assertRaises(exporters.ExportError) as caught:
+                exporters.export(srt, SEGMENTS, TRACKS, "m")
+        self.assertEqual(srt.read_text(encoding="utf-8"), "old .srt")
+        self.assert_no_staged_files_left()
+        self.assertEqual(str(caught.exception).splitlines()[0],
+                         "Could not write session.srt: Access is denied")
+
+    def test_a_successful_export_replaces_every_file_whole(self):
+        written = exporters.export_all(self.base, SEGMENTS, TRACKS, "m")
+        self.assertEqual(written, self.targets)
+        self.assertEqual(self.contents()["session.vtt"], exporters.to_vtt(SEGMENTS))
+        self.assert_no_staged_files_left()
 
 
 if __name__ == "__main__":

@@ -940,6 +940,60 @@ class IncompleteExport(_WindowTest):
         self.assertEqual([s["text"] for s in data["segments"]], ["Hello there."])
 
 
+class ExportFailures(_WindowTest):
+    """A write that fails partway is reported as far as it got."""
+
+    def setUp(self):
+        super().setUp()
+        self.folder = Path(self.temp.name)
+        self.critical = self._patch("main_window.QMessageBox.critical")
+        self.add(Track(Path("alice.wav"), "Alice", status=TrackStatus.DONE,
+                       segments=[Segment("Alice", 1.0, 2.0, "Hello there.")]))
+
+    def replace_failing_on(self, call):
+        real = os.replace
+        calls = []
+
+        def replace(source, target):
+            calls.append(target)
+            if len(calls) == call:
+                raise PermissionError(13, "Access is denied")
+            return real(source, target)
+        return patch("exporters.os.replace", side_effect=replace)
+
+    def test_a_partial_all_formats_export_names_what_was_written(self):
+        all_formats = main_window.EXPORT_FILTERS.split(";;")[-1]
+        self._patch("main_window.QFileDialog.getSaveFileName",
+                    return_value=(str(self.folder / "out.md"), all_formats))
+        with self.replace_failing_on(2):
+            self.window.export_dialog()
+        title, message = self.critical.call_args.args[1:3]
+        self.assertEqual(title, "Export incomplete")
+        self.assertIn("Exported out.md, but could not write out.txt", message)
+        self.assertEqual(self.window.statusBar().currentMessage(), "Partly exported: out.md")
+
+    def test_a_failed_single_export_says_nothing_was_written(self):
+        self._patch("main_window.QFileDialog.getSaveFileName",
+                    return_value=(str(self.folder / "out.srt"), "SubRip subtitles (*.srt)"))
+        with self.replace_failing_on(1):
+            self.window.export_dialog()
+        title, message = self.critical.call_args.args[1:3]
+        self.assertEqual(title, "Export failed")
+        self.assertIn("Nothing was exported", message)
+        self.assertEqual(list(self.folder.glob("out*")), [])
+
+    def test_a_failed_notes_export_keeps_the_earlier_file(self):
+        target = self.folder / "notes-export.md"
+        target.write_text("Last week's notes", encoding="utf-8")
+        self.window.notes_edit.setPlainText("This week's notes")
+        self._patch("main_window.QFileDialog.getSaveFileName",
+                    return_value=(str(target), "Markdown (*.md)"))
+        with self.replace_failing_on(1):
+            self.window.export_notes_dialog()
+        self.assertEqual(self.critical.call_args.args[1], "Export failed")
+        self.assertEqual(target.read_text(encoding="utf-8"), "Last week's notes")
+
+
 class WorkerLifecycle(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "win32", "Windows windowed launcher")
     def test_pythonw_source_launch_records_startup_errors_and_timings(self):
