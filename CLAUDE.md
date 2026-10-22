@@ -273,6 +273,12 @@ is ever applied automatically; a typed value is the undo.
   cuts audio into VAD speech regions, detects language once from the
   clearest sample and locks it for the whole track, then drops segments
   written in a script the locked language can't use (`_foreign_script`).
+  Its languages are a closed list: `QWEN_LANGUAGE_NAMES` holds only names
+  qwen-asr accepts (0.0.6 has no Norwegian or Ukrainian), and
+  `language_supported` is checked twice. The window greys out what the
+  chosen model lacks and refuses a selection it already had, never turning
+  it into auto-detect; `TranscribeWorker.run` refuses it before any model
+  loads, so the error can't reach the GPU-to-CPU retry.
 
 Adding a model usually means adding an alias to `WHISPER_ALIASES` /
 `ONNX_ALIASES` / `QWEN_REPOS`, and (for the UI) to `MODEL_GROUPS` in
@@ -445,6 +451,8 @@ What is pinned, and why it is worth keeping pinned:
   everything downstream assumes; `test_merger` also pins the
   `MAX_COALESCE_CHARS` invariant that `llm.py`'s line-boundary splitting
   depends on, which is otherwise only a comment reaching across two modules.
+  `test_transcriber` also checks Qwen's language list against the installed
+  qwen-asr's, read from its source rather than imported (that loads torch).
 - `test_exporters` — timestamp formats, VTT escaping, and `target_paths`
   (the "Session 2.5" case, where `with_suffix` would write a file the user
   never named).

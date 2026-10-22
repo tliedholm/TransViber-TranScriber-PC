@@ -154,6 +154,68 @@ class WindowLifecycle(_WindowTest):
         self.assertEqual(item.toolTip(), "")
 
 
+class LanguageChoices(_WindowTest):
+    """Languages the chosen model can't take: greyed out, and flagged and
+    refused when one is already selected, never quietly turned into
+    auto-detect."""
+
+    def language_row(self, code):
+        return self.window.combo_lang.findData(code)
+
+    def item(self, code):
+        return self.window.combo_lang.model().item(self.language_row(code))
+
+    def test_qwen_greys_out_what_it_lacks_and_whisper_gets_it_back(self):
+        w = self.window
+        w.combo_model.setCurrentText("qwen3-asr-1.7b")
+        self.assertFalse(self.item("no").isEnabled())
+        self.assertFalse(self.item("uk").isEnabled())
+        self.assertTrue(self.item("en").isEnabled())
+        self.assertTrue(self.item(None).isEnabled())
+        w.combo_model.setCurrentText("large-v3")
+        self.assertTrue(self.item("no").isEnabled())
+        self.assertTrue(self.item("uk").isEnabled())
+
+    def test_a_typed_qwen_repo_gets_the_same_choices(self):
+        self.window.combo_model.setCurrentText("Qwen/Qwen3-ASR-0.6B")
+        self.assertFalse(self.item("no").isEnabled())
+
+    def test_switching_to_qwen_keeps_the_language_and_flags_it(self):
+        w = self.window
+        w.combo_model.setCurrentText("large-v3")
+        w.combo_lang.setCurrentIndex(self.language_row("no"))
+        self.assertTrue(w.label_lang_conflict.isHidden())
+        w.combo_model.setCurrentText("qwen3-asr-1.7b")
+        self.assertEqual(w.combo_lang.currentData(), "no")
+        self.assertFalse(w.label_lang_conflict.isHidden())
+        self.assertIn("Norwegian", w.label_lang_conflict.toolTip())
+        w.combo_lang.setCurrentIndex(self.language_row("en"))
+        self.assertTrue(w.label_lang_conflict.isHidden())
+
+    def test_transcribe_refuses_the_conflict_and_changes_nothing(self):
+        w = self.window
+        self.add(Track(Path("alice.wav"), "Alice"))
+        w.combo_model.setCurrentText("qwen3-asr-1.7b")
+        w.combo_lang.setCurrentIndex(self.language_row("uk"))
+        status = w.table.item(0, main_window.COL_STATUS).text()
+        with patch("main_window.TranscribeWorker") as worker_class, \
+                patch("main_window.QMessageBox.warning") as warning, \
+                patch("main_window.llm.free_llm") as free_llm:
+            w.toggle_transcription()
+        worker_class.assert_not_called()
+        free_llm.assert_not_called()
+        self.assertIn("Ukrainian", warning.call_args.args[2])
+        self.assertIsNone(w.worker)
+        self.assertEqual(w.table.item(0, main_window.COL_STATUS).text(), status)
+
+    def test_a_saved_conflict_is_flagged_at_startup(self):
+        self.settings.setValue("model", "qwen3-asr-0.6b")
+        self.settings.setValue("language", "no")
+        self.window._load_settings()
+        self.assertEqual(self.window.combo_lang.currentData(), "no")
+        self.assertFalse(self.window.label_lang_conflict.isHidden())
+
+
 class OffsetColumn(_WindowTest):
     """A track's Offset cell: what a committed edit does (`edit`), and the
     real cell editor that commits one (`type_into_offset_cell`)."""
@@ -915,6 +977,19 @@ class WorkerLifecycle(unittest.TestCase):
         with patch.object(worker, "_load_model") as load:
             worker.run()
             load.assert_not_called()
+
+    def test_a_language_the_model_lacks_fails_before_loading_or_retrying(self):
+        worker = transcriber.TranscribeWorker([], [0, 1], "qwen3-asr-1.7b", "cuda", "no")
+        failures, finished = [], []
+        worker.track_failed.connect(lambda i, message: failures.append((i, message)))
+        worker.finished_all.connect(finished.append)
+        with patch("transcriber._get_model") as load:
+            worker.run()
+            load.assert_not_called()
+        self.assertEqual([i for i, _ in failures], [0, 1])
+        self.assertIn("can't transcribe", failures[0][1])
+        self.assertEqual(finished, [False])
+        self.assertEqual(worker.device, "cuda")  # no CPU retry was attempted
 
     def test_cancelled_notes_does_not_download_or_spawn_a_server(self):
         worker = llm.NotesWorker("Alice: hello")

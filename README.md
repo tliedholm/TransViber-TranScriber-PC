@@ -167,7 +167,9 @@ onnx-asr model names. Whisper models run via
 faster-whisper/CTranslate2; NVIDIA models run via onnx-asr/ONNX Runtime, both
 on the GPU with the shared CUDA 12 runtime. The Language dropdown applies to
 Whisper **and** Qwen models (Qwen is given the language by name); only
-Parakeet/Canary ignore it and auto-detect. Note that the routing goes by
+Parakeet/Canary ignore it and auto-detect. Qwen3-ASR has no Norwegian or
+Ukrainian, so those are greyed out while a Qwen model is selected, and
+Transcribe asks for another choice if one of them was already picked. Note that the routing goes by
 name: anything starting with `qwen` goes to the Qwen backend, names like
 `parakeet…`/`canary…`/`nemo-…` go to onnx-asr, and everything else is
 treated as a Whisper/CTranslate2 repo. Your RTX 5070 Ti (16 GB) handles any
