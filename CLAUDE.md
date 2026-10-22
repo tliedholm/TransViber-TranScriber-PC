@@ -114,7 +114,9 @@ Qt `Signal`s (never touch widgets off the main thread):
 `TranscribeWorker` (`transcriber.py`), `NotesWorker` (`llm.py`),
 `AlignWorker` (`align.py`), and `StatsPoller` (`stats.py`, the
 GPU/VRAM/CPU/RAM status readout via NVML + psutil). `MainWindow` connects
-to their signals and updates widgets.
+to their signals and updates widgets. A one-shot answer can instead stay on
+the worker for the `finished` handler to read after `wait()`: `AlignWorker`
+leaves `result`, `error` and `cancelled` there.
 
 `DeviceProbe` checks CUDA through the driver API in a background thread
 after the window opens. Do not import CTranslate2/PyTorch to detect the GPU

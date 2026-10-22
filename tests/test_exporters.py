@@ -30,8 +30,8 @@ class Timestamps(unittest.TestCase):
         self.assertEqual(exporters._ts_vtt(3661.25), "01:01:01.250")
 
     def test_readable_timestamps_drop_a_zero_hour(self):
-        self.assertEqual(exporters._hms(75), "1:15")
-        self.assertEqual(exporters._hms(3675), "1:01:15")
+        self.assertEqual(exporters.hms(75), "1:15")
+        self.assertEqual(exporters.hms(3675), "1:01:15")
 
 
 class Escaping(unittest.TestCase):

@@ -10,7 +10,9 @@ from merger import coalesce
 from models import Segment, Track
 
 
-def _hms(seconds: float) -> str:
+def hms(seconds: float) -> str:
+    """Whole seconds as `m:ss`, or `h:mm:ss` from an hour: the clock the
+    track table, the transcript and the text exports all show."""
     s = int(seconds)
     h, rem = divmod(s, 3600)
     m, s = divmod(rem, 60)
@@ -55,7 +57,7 @@ def to_markdown(segments: list[Segment], tracks: list[Track] | None = None,
                 model_name: str = "") -> str:
     lines = ["# Transcript", ""]
     for seg in coalesce(segments):
-        lines.append(f"**{seg.speaker}** \\[{_hms(seg.start)}\\]: {seg.text}")
+        lines.append(f"**{seg.speaker}** \\[{hms(seg.start)}\\]: {seg.text}")
         lines.append("")
     return "\n".join(lines)
 
@@ -64,7 +66,7 @@ def to_text(segments: list[Segment], tracks: list[Track] | None = None,
             model_name: str = "") -> str:
     lines = []
     for seg in coalesce(segments):
-        lines.append(f"[{_hms(seg.start)}] {seg.speaker}: {seg.text}")
+        lines.append(f"[{hms(seg.start)}] {seg.speaker}: {seg.text}")
         lines.append("")
     return "\n".join(lines)
 

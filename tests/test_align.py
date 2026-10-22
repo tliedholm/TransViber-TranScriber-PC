@@ -683,13 +683,6 @@ class SuggestOffsets(unittest.TestCase):
             suggest_offsets(paths, fingerprints, {}, matcher=_Matcher(), should_stop=lambda: True)
 
 
-class _Recorder:
-    def __init__(self, worker: AlignWorker) -> None:
-        self.results, self.errors = [], []
-        worker.finished_ok.connect(self.results.append)
-        worker.failed.connect(self.errors.append)
-
-
 class Worker(_Session):
     """AlignWorker.run() called directly, with decoding replaced by energies."""
 
@@ -701,42 +694,39 @@ class Worker(_Session):
             return value
         worker = AlignWorker([(Path(f"{u}.wav"), [None]) for u in units], {},
                              (Path(f"{reference}.wav"), [None]) if reference else None)
-        recorder = _Recorder(worker)
         with patch("align.decode_energy", side_effect=decode):
             worker.run()
-        return worker, recorder
+        return worker
 
     def test_an_unreadable_session_reference_fails_the_run(self):
         for name, value in (("unreadable", OSError("no such file")),
                             ("silent", np.zeros(60000))):
             with self.subTest(name):
-                _worker, rec = self._worker({"session": value, "a": self.late, "b": self.mix},
-                                            reference="session")
-                self.assertEqual(rec.results, [])
-                self.assertEqual(len(rec.errors), 1)
-                self.assertIn("session reference session.wav", rec.errors[0])
-                self.assertIn("No offsets were changed", rec.errors[0])
+                worker = self._worker({"session": value, "a": self.late, "b": self.mix},
+                                      reference="session")
+                self.assertIsNone(worker.result)
+                self.assertIn("session reference session.wav", worker.error)
+                self.assertIn("No offsets were changed", worker.error)
 
     def test_an_unreadable_speaker_file_only_fails_its_row(self):
-        _worker, rec = self._worker({"session": self.mix, "a": OSError("bad header"),
-                                     "b": self.late}, reference="session")
-        rows = {s.path.stem: s for s in rec.results[0].suggestions}
+        worker = self._worker({"session": self.mix, "a": OSError("bad header"),
+                               "b": self.late}, reference="session")
+        rows = {s.path.stem: s for s in worker.result.suggestions}
         self.assertEqual(rows["a"].method, "error")
         self.assertAlmostEqual(rows["b"].offset, 73.45)
 
     def test_a_silent_speaker_file_gets_a_reason(self):
-        _worker, rec = self._worker({"a": self.mix, "b": np.zeros(60000)})
-        rows = {s.path.stem: s for s in rec.results[0].suggestions}
+        worker = self._worker({"a": self.mix, "b": np.zeros(60000)})
+        rows = {s.path.stem: s for s in worker.result.suggestions}
         self.assertIn("no usable audio", rows["b"].reason)
 
     def test_nothing_readable_is_an_error(self):
-        _worker, rec = self._worker({"a": OSError("x"), "b": OSError("y")})
-        self.assertEqual(rec.results, [])
-        self.assertIn("None of the files could be read", rec.errors[0])
+        worker = self._worker({"a": OSError("x"), "b": OSError("y")})
+        self.assertIsNone(worker.result)
+        self.assertIn("None of the files could be read", worker.error)
 
     def test_cancelling_while_reading_the_reference_emits_nothing(self):
         worker = AlignWorker([(Path("a.wav"), [None])], {}, (Path("session.wav"), [None]))
-        recorder = _Recorder(worker)
 
         def chunks(path, stream, rate):
             yield np.zeros(800)
@@ -747,14 +737,19 @@ class Worker(_Session):
         with patch("audio.iter_stream_power", side_effect=chunks):
             worker.run()
         self.assertTrue(worker.cancelled)
-        self.assertEqual((recorder.results, recorder.errors), ([], []))
+        self.assertEqual((worker.result, worker.error), (None, ""))
+
+
+def _shaped_noise(energy, seed: int):
+    """8 kHz noise whose frame energies are `energy`."""
+    rng = np.random.default_rng(seed)
+    hop = align.DECODE_RATE // FRAME_RATE
+    return rng.standard_normal(energy.size * hop) * np.sqrt(np.repeat(energy, hop))
 
 
 def _write_wav(path: Path, energy, seed: int, channels: int = 1, channel: int = 0) -> Path:
     """Noise shaped by frame energies, as 8 kHz 16-bit, on one of `channels`."""
-    rng = np.random.default_rng(seed)
-    hop = align.DECODE_RATE // FRAME_RATE
-    samples = rng.standard_normal(energy.size * hop) * np.sqrt(np.repeat(energy, hop))
+    samples = _shaped_noise(energy, seed)
     frames = np.zeros((samples.size, channels))
     frames[:, channel] = samples
     with wave.open(str(path), "wb") as out:
@@ -788,10 +783,9 @@ class RealDecode(unittest.TestCase):
             reference = _write_wav(Path(folder, "session.wav"), session, 1)
             late = _write_wav(Path(folder, "late.wav"), own[4137:], 2)
             worker = AlignWorker([(late, [None])], {}, (reference, [None]))
-            recorder = _Recorder(worker)
             worker.run()
-        self.assertEqual(recorder.errors, [])
-        (row,) = recorder.results[0].suggestions
+        self.assertEqual(worker.error, "")
+        (row,) = worker.result.suggestions
         self.assertEqual((row.method, row.strength), ("matched", "strong"))
         self.assertAlmostEqual(row.offset, 41.37, places=2)
 
@@ -805,10 +799,9 @@ class RealDecode(unittest.TestCase):
                 reference = _write_wav(Path(folder, "session.wav"), session, 1)
                 late = _write_wav(Path(folder, "late.wav"), own[4137:], 2, channels, speaker)
                 worker = AlignWorker([(late, [0])], {}, (reference, [None]))
-                recorder = _Recorder(worker)
                 worker.run()
-                self.assertEqual(recorder.errors, [])
-                (row,) = recorder.results[0].suggestions
+                self.assertEqual(worker.error, "")
+                (row,) = worker.result.suggestions
                 self.assertEqual(row.strength, "strong")
                 self.assertAlmostEqual(row.offset, 41.37, places=2)
 
@@ -818,17 +811,15 @@ class RealDecode(unittest.TestCase):
             session = speech(300, 50) + 0.5 * speech(300, 51) + hiss(300, 52)
             own = (speech(300, 50) + hiss(300, 53))[4137:]
             reference = _write_wav(Path(folder, "session.wav"), session, 1)
-            rng = np.random.default_rng(2)
-            hop = align.DECODE_RATE // FRAME_RATE
-            frames = np.zeros((own.size * hop, 3))
-            frames[:, 0] = rng.standard_normal(own.size * hop) * np.sqrt(np.repeat(own, hop))
+            noise = _shaped_noise(own, 2)
+            frames = np.zeros((noise.size, 3))
+            frames[:, 0] = noise
             frames[60 * align.DECODE_RATE:, 1] = np.nan
             late = _write_float_wav(Path(folder, "late.wav"), frames)
             worker = AlignWorker([(late, [None])], {}, (reference, [None]))
-            recorder = _Recorder(worker)
             worker.run()
-        self.assertEqual(recorder.errors, [])
-        (row,) = recorder.results[0].suggestions
+        self.assertEqual(worker.error, "")
+        (row,) = worker.result.suggestions
         self.assertEqual(row.strength, "strong")
         self.assertAlmostEqual(row.offset, 41.37, places=2)
 
