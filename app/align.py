@@ -67,7 +67,7 @@ RUNNER_UP_EXCLUSION_SECONDS = 0.5   # the peak's own shoulders aren't a rival
 # be MIN_PART_SECONDS long; the end parts only need room for two of them that
 # don't overlap, so a short match is checked too. Under 160 s of overlap
 # (a strong match there means a recording under about three minutes) there
-# is nothing to check with, and an edit goes unseen.
+# is nothing to check with, so such a match is only ever offered as weak.
 CONSISTENCY_SECONDS = 0.1
 MIN_PART_SECONDS = 80       # a part shorter than this is too little to judge
 # Against a full-session reference a strong match also has to be found again,
@@ -401,7 +401,8 @@ def find_offset(ref, other, require_window_agreement: bool = False) -> Match:
     on enough overlap and enough sound in each file, and no part of the
     overlap — its first and last thirds, sixths, twelfths and 80 s, those that
     fit (`_part_sizes`) — may clearly find its own match somewhere else: one
-    fixed offset can't fit both (drift, a pause, an edit). With
+    fixed offset can't fit both (drift, a pause, an edit). An overlap too
+    short for any of those parts can't be checked, so it is never strong. With
     `require_window_agreement` — every match against a full-session
     reference, direct or chained — separate stretches of `other`'s active
     audio must each find the same lag on their own, and none may find its own
@@ -451,6 +452,8 @@ def find_offset(ref, other, require_window_agreement: bool = False) -> Match:
             return _weak(match, f"only {agreeing} of {checked} separate parts of the file "
                                 f"confirm it" if checked else
                                 "too little audio to confirm it in separate parts")
+    if not _part_sizes(overlap):
+        return _weak(match, "too short to check for an edit")
     return match
 
 

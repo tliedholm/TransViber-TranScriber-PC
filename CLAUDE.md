@@ -270,14 +270,16 @@ is ever applied automatically; a typed value is the undo.
   240 s of overlap, but the two 80 s parts are checked from 160 s, where
   they no longer overlap (`_part_sizes`): before that, a three-minute file
   with a cut in it passed as strong unchecked. Under 160 s of overlap — a
-  strong match there needs a file under about three minutes — nothing checks
-  for an edit; that limit is pinned in `test_align`. Surveyed on 400 short
-  synthetic sessions (170–270 s files), the 80 s parts downgraded no
-  unedited match; of files with a 1–30 s cut, the share still strong
-  without a session reference fell from about half to a third against a mix
-  and a fifth in a shared room. A part is only scored at lags where
-  nearly all of it lies inside the reference, since a sliver of overlap at
-  the edge throws up chance peaks, and only once it holds
+  strong match there needs a file under about three minutes — nothing can
+  check for an edit, so the match is offered as weak, "too short to check
+  for an edit": unticked, and never used to place another file. Against a
+  session reference, a reason from the stretches (below) comes first.
+  Surveyed on 400 short synthetic sessions (170–270 s files), the 80 s
+  parts downgraded no unedited match; of files with a 1–30 s cut, the share
+  still strong without a session reference fell from about half to a third
+  against a mix and a fifth in a shared room. A part is only scored at lags
+  where nearly all of it lies inside the reference, since a sliver of
+  overlap at the edge throws up chance peaks, and only once it holds
   `MIN_ACTIVE_SECONDS` of sound itself. It downgrades the match when its
   clear peak (≥ `WEAK_RATIO`) lands more than 0.1 s away, or when it has two
   real peaks, neither clear of the other but both clear of everything else,
