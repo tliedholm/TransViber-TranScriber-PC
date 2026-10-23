@@ -285,20 +285,27 @@ class FindOffset(_Session):
     def test_a_short_edited_recording_is_checked(self):
         # A file that lost 5 s 50 s in. Under 240 s of overlap no third is
         # 80 s long, but the first and last 80 s fit without overlapping, and
-        # the first finds the cut. Under 160 s there is no room for two: an
-        # edit goes unseen there, which is the known limit, pinned so that it
-        # changes on purpose. The same files unedited stay strong throughout.
-        for length, strength in ((158, "strong"), (162, "weak"), (180, "weak"),
-                                 (238, "weak"), (242, "weak")):
+        # the first finds the cut. The same files unedited stay strong.
+        for length in (162, 180, 238, 242):
             with self.subTest(length=length):
                 energy = speech(length + 5, 1, talk=0.8) + hiss(length + 5, 50)
                 edited = np.concatenate([energy[:5000], energy[5500:]])
                 match = find_offset(fingerprint(energy), fingerprint(edited))
-                self.assertEqual((match.strength, match.lag), (strength, 5.0))
-                if strength == "weak":
-                    self.assertIn("start and end disagree by 5.0 s", match.detail)
+                self.assertEqual((match.strength, match.lag), ("weak", 5.0))
+                self.assertIn("start and end disagree by 5.0 s", match.detail)
                 clean = find_offset(fingerprint(energy), fingerprint(energy[500:]))
                 self.assertEqual((clean.strength, clean.lag), ("strong", 5.0))
+
+    def test_a_match_too_short_to_check_is_never_strong(self):
+        # Under 160 s of overlap there is no room for two 80 s parts, so an
+        # edit would go unseen: edited or not, the match is only offered.
+        energy = speech(163, 1, talk=0.8) + hiss(163, 50)
+        edited = np.concatenate([energy[:5000], energy[5500:]])
+        for name, other in (("edited", edited), ("unedited", energy[500:])):
+            with self.subTest(name):
+                match = find_offset(fingerprint(energy), fingerprint(other))
+                self.assertEqual((match.strength, match.lag), ("weak", 5.0))
+                self.assertEqual(match.detail, "too short to check for an edit")
 
     def test_part_sizes_around_the_boundaries(self):
         # 80 s parts once two fit; thirds and smaller once a third is 80 s.
@@ -444,10 +451,11 @@ class WindowAgreement(_Session):
     def test_too_little_audio_to_confirm_stays_weak(self):
         short = (self.c + hiss(SESSION, 19))[LATE:LATE + 60 * FRAME_RATE]
         whole = find_offset(fingerprint(self.mix), fingerprint(short))
-        self.assertEqual(whole.strength, "strong")  # the same peak, unconfirmed
+        self.assertEqual(whole.detail, "too short to check for an edit")
         match = find_offset(fingerprint(self.mix), fingerprint(short), require_window_agreement=True)
         self.assertEqual(match.strength, "weak")
-        self.assertIn("too little audio", match.detail)
+        self.assertAlmostEqual(match.lag, 73.45, places=2)   # the same peak, unconfirmed
+        self.assertIn("too little audio", match.detail)      # what the stretches found comes first
 
     def test_stretches_come_from_where_the_speaker_talks(self):
         # Talking only in the first third, hiss after: confirmed there, not
